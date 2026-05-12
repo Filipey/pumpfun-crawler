@@ -46,7 +46,13 @@ from collectors.dune.queries import (
     TOKEN_CREATIONS_RAW_SQL,
     TOKEN_CREATIONS_SQL,
 )
-from config import DUNE_API_KEY, PARQUET_DIR
+from config import (
+    DUNE_API_KEY,
+    DUNE_QUERY_CREATIONS,
+    DUNE_QUERY_MIGRATIONS,
+    DUNE_QUERY_TRADES,
+    PARQUET_DIR,
+)
 from schemas import MIGRATION_COLS, RAW_TRADE_COLS, TOKEN_CREATION_COLS, coerce_schema
 from utils import save_parquet
 
@@ -101,14 +107,14 @@ class Worker:
         checkpoint: DuneCheckpoint,
         monthly_budget: int,
         out_dir: Path,
-        use_raw_creations: bool = False,
+        query_ids: dict[str, int],
     ):
         self.api_key = api_key
         self.cp = checkpoint
         self.budget = monthly_budget
         self.out = out_dir
         self.runner = DuneRunner(api_key=api_key)
-        self.creations_sql = TOKEN_CREATIONS_RAW_SQL if use_raw_creations else TOKEN_CREATIONS_SQL
+        self.query_ids = query_ids   # {"creations": N, "trades": N, "migrations": N}
 
     # ── credit gate ───────────────────────────────────────────────────────────
 
@@ -130,10 +136,10 @@ class Worker:
 
     # ── execute with truncation guard ─────────────────────────────────────────
 
-    def _execute(self, sql: str, params: dict, label: str, depth: int = 0) -> pd.DataFrame:
+    def _execute(self, query_id: int, params: dict, label: str, depth: int = 0) -> pd.DataFrame:
         self._wait_if_over_budget()
         try:
-            df = self.runner.execute_sql(sql, params, name=label)
+            df = self.runner.run_saved_query(query_id, params, name=label)
             self.cp.add_credits(self.api_key, CREDITS_PER_QUERY)
         except Exception as exc:
             logger.error(f"[{label}] query failed: {exc}")
@@ -151,7 +157,7 @@ class Worker:
                 sub = {**params,
                        "date_start": s.strftime("%Y-%m-%d %H:%M:%S"),
                        "date_end":   e.strftime("%Y-%m-%d %H:%M:%S")}
-                parts.append(self._execute(sql, sub, f"{label}_h{i}", depth + 1))
+                parts.append(self._execute(query_id, sub, f"{label}_h{i}", depth + 1))
             return pd.concat(parts, ignore_index=True)
 
         return df
@@ -166,11 +172,6 @@ class Worker:
         }
         label = f"{query_type}_{key}"
 
-        sql_map = {
-            "creations":  self.creations_sql,
-            "trades":     ALL_TRADES_SQL,
-            "migrations": MIGRATIONS_SQL,
-        }
         schema_map = {
             "creations":  TOKEN_CREATION_COLS,
             "trades":     RAW_TRADE_COLS,
@@ -178,7 +179,7 @@ class Worker:
         }
 
         try:
-            df = self._execute(sql_map[query_type], params, label)
+            df = self._execute(self.query_ids[query_type], params, label)
         except Exception:
             logger.error(f"Skipping {label} after error.")
             return 0
@@ -208,20 +209,21 @@ class AutoCollector:
     def __init__(
         self,
         api_keys: list[str],
+        query_ids: dict[str, int],
         monthly_budget: int = DEFAULT_MONTHLY_BUDGET,
         out_dir: Path | None = None,
-        use_raw_creations: bool = False,
         checkpoint_path: Path = Path("data/dune_checkpoint.json"),
     ):
         if not api_keys:
             raise ValueError("At least one API key is required.")
         self.api_keys = api_keys
+        self.query_ids = query_ids
         self.cp = DuneCheckpoint(checkpoint_path)
         self.budget = monthly_budget
         self.out = out_dir or (PARQUET_DIR / "dune")
         self.out.mkdir(parents=True, exist_ok=True)
         self.workers = [
-            Worker(key, self.cp, monthly_budget, self.out, use_raw_creations)
+            Worker(key, self.cp, monthly_budget, self.out, query_ids)
             for key in api_keys
         ]
 
@@ -302,7 +304,69 @@ class AutoCollector:
         print(self.cp.summary(self.api_keys, self.budget))
 
 
-# ── key loading ───────────────────────────────────────────────────────────────
+# ── setup instructions ────────────────────────────────────────────────────────
+
+def _print_setup():
+    """Print step-by-step instructions for creating the 3 required Dune queries."""
+    from collectors.dune.queries import (
+        ALL_TRADES_SQL, MIGRATIONS_SQL, TOKEN_CREATIONS_SQL,
+    )
+    sep = "─" * 72
+
+    print(f"""
+{sep}
+  DUNE QUERY SETUP  (one-time, ~5 minutes)
+{sep}
+
+The Dune free-tier API cannot CREATE queries — it can only EXECUTE ones
+you already saved in the Dune IDE.  You need to create 3 queries manually,
+then add their numeric IDs to your .env file.
+
+STEP 1 — Go to https://dune.com  and log in (free account is fine).
+
+STEP 2 — Create the 3 queries below.  For each one:
+  a) Click "New Query"
+  b) Paste the SQL
+  c) Click Run once to confirm it works
+  d) Click the query title and give it a recognisable name
+  e) Note the numeric ID in the URL:  dune.com/queries/XXXXXXX
+  f) Make the query public (or at least saved)
+
+─── Query 1: TOKEN CREATIONS ────────────────────────────────────────────────
+Suggested name: pumpfun-creations
+
+{TOKEN_CREATIONS_SQL.strip()}
+
+─── Query 2: ALL TRADES ─────────────────────────────────────────────────────
+Suggested name: pumpfun-trades
+
+{ALL_TRADES_SQL.strip()}
+
+─── Query 3: MIGRATIONS ─────────────────────────────────────────────────────
+Suggested name: pumpfun-migrations
+
+{MIGRATIONS_SQL.strip()}
+
+{sep}
+STEP 3 — Add the IDs to your .env file:
+
+  DUNE_QUERY_CREATIONS=<ID from query 1>
+  DUNE_QUERY_TRADES=<ID from query 2>
+  DUNE_QUERY_MIGRATIONS=<ID from query 3>
+
+STEP 4 — Run the collector:
+
+  python collect_dune_auto.py --start 2025-01-01 --end 2026-05-13
+{sep}
+NOTE: The queries use {{{{date_start}}}} and {{{{date_end}}}} parameters.
+Dune will auto-detect these as text parameters when you first run them.
+Leave the default values empty or set them to any valid date — the script
+will always override them at execution time.
+{sep}
+""")
+
+
+# ── key / query-id loading ────────────────────────────────────────────────────
 
 def _load_keys(keys_file: str | None, require: bool = True) -> list[str]:
     if keys_file:
@@ -318,7 +382,6 @@ def _load_keys(keys_file: str | None, require: bool = True) -> list[str]:
             sys.exit(f"No keys found in {path}")
         logger.info(f"Loaded {len(keys)} API key(s) from {path}")
         return keys
-    # Fall back to single key from .env
     if not DUNE_API_KEY or DUNE_API_KEY == "YOUR_DUNE_API_KEY_HERE":
         if require:
             sys.exit(
@@ -327,6 +390,27 @@ def _load_keys(keys_file: str | None, require: bool = True) -> list[str]:
             )
         return []
     return [DUNE_API_KEY]
+
+
+def _load_query_ids(types: list[str], raw_creations: bool) -> dict[str, int]:
+    """
+    Load saved Dune query IDs from config. Exits with a helpful message if any
+    required ID is missing (0 means not configured).
+    """
+    from collectors.dune.queries import TOKEN_CREATIONS_RAW_SQL  # noqa: F401
+    id_map = {
+        "creations":  DUNE_QUERY_CREATIONS,
+        "trades":     DUNE_QUERY_TRADES,
+        "migrations": DUNE_QUERY_MIGRATIONS,
+    }
+    missing = [t for t in types if id_map.get(t, 0) == 0]
+    if missing:
+        sys.exit(
+            f"\nMissing Dune query IDs for: {', '.join(missing)}\n"
+            f"Run  python collect_dune_auto.py --setup  for instructions.\n"
+            f"Then add the IDs to your .env file and retry."
+        )
+    return {t: id_map[t] for t in types}
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -354,7 +438,10 @@ def _parse_args():
                         f"Default: {DEFAULT_MONTHLY_BUDGET} (free tier ≈ 2,500). "
                         f"Use 50000 for Dune Plus.")
     p.add_argument("--status", action="store_true",
-                   help="Print progress and exit.")
+                   help="Print collection progress and exit.")
+    p.add_argument("--setup", action="store_true",
+                   help="Print step-by-step instructions for creating the required "
+                        "Dune queries in the web IDE, then exit.")
     p.add_argument("--raw-creations", action="store_true",
                    help="Use raw instruction_calls fallback for token creations.")
     p.add_argument("--checkpoint", default="data/dune_checkpoint.json",
@@ -365,19 +452,23 @@ def _parse_args():
 def main():
     args = _parse_args()
 
-    # For --status we don't need a key (checkpoint is read-only).
+    if args.setup:
+        _print_setup()
+        return
+
     if args.status:
         keys = _load_keys(args.keys_file, require=False)
         cp = DuneCheckpoint(Path(args.checkpoint))
         print(cp.summary(keys, args.budget))
         return
 
-    api_keys = _load_keys(args.keys_file, require=True)
+    api_keys  = _load_keys(args.keys_file, require=True)
+    query_ids = _load_query_ids(args.types, args.raw_creations)
 
     collector = AutoCollector(
         api_keys=api_keys,
+        query_ids=query_ids,
         monthly_budget=args.budget,
-        use_raw_creations=args.raw_creations,
         checkpoint_path=Path(args.checkpoint),
     )
 

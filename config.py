@@ -15,6 +15,13 @@ load_dotenv()
 # ── Dune Analytics (retroactive bulk collection — FREE) ───────────────────
 DUNE_API_KEY: str = os.getenv("DUNE_API_KEY", "YOUR_DUNE_API_KEY_HERE")
 
+# Pre-saved query IDs (create once in Dune IDE, then paste the IDs here).
+# Free-tier API can only execute existing queries; it cannot create new ones.
+# Run: python collect_dune_auto.py --setup  for step-by-step instructions.
+DUNE_QUERY_CREATIONS:  int = int(os.getenv("DUNE_QUERY_CREATIONS",  "0"))
+DUNE_QUERY_TRADES:     int = int(os.getenv("DUNE_QUERY_TRADES",     "0"))
+DUNE_QUERY_MIGRATIONS: int = int(os.getenv("DUNE_QUERY_MIGRATIONS", "0"))
+
 # ── Bitquery API (continuous daily collection — FREE) ─────────────────────
 BITQUERY_TOKEN: str = os.getenv("BITQUERY_TOKEN", "YOUR_BITQUERY_TOKEN_HERE")
 BITQUERY_ENDPOINT: str = "https://streaming.bitquery.io/graphql"

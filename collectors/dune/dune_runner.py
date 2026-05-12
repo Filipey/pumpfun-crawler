@@ -1,16 +1,20 @@
 """
 collectors/dune/dune_runner.py
 -------------------------------
-Wrapper around dune-client SDK for executing parameterized SQL queries.
+Wrapper around dune-client SDK for executing Dune Analytics queries.
 
-Two modes of operation:
-  1. API mode: create + execute queries programmatically (costs credits)
-  2. Manual mode: generate SQL files for the user to run in the Dune IDE
-     (free, unlimited) and then import the CSVs
+Free-tier usage (REQUIRED approach):
+  The Dune free plan CANNOT create queries via API (POST /api/v1/query → 402).
+  Queries must be created once in the Dune web IDE, then executed by ID:
 
-The free Dune plan gives ~2500 API credits/month. Each medium execution
-costs ~10 credits, so ~250 queries/month. For bulk retroactive collection,
-manual mode may be necessary.
+    runner.run_saved_query(query_id=1234567, params={"date_start": "2025-01-01", ...})
+
+  This uses POST /api/v1/query/{id}/execute which IS available on the free tier.
+  Each execution costs ~10 credits from the 2,500/month free budget.
+
+One-time setup:
+  Run: python collect_dune_auto.py --setup
+  It prints the SQL and guides you through creating the 3 queries in the IDE.
 """
 
 import logging
@@ -68,7 +72,48 @@ class DuneRunner:
             rendered = rendered.replace(f"{{{{{key}}}}}", str(value))
         return rendered
 
-    # ── API mode ──────────────────────────────────────────────────────────
+    # ── API mode (free-tier compatible) ──────────────────────────────────────
+
+    def run_saved_query(
+        self,
+        query_id: int,
+        params: dict,
+        name: str = "query",
+    ) -> pd.DataFrame:
+        """
+        Execute a pre-saved Dune query with text parameters.
+
+        Free-tier compatible: uses POST /api/v1/query/{id}/execute, which does
+        NOT require a paid plan. Creating queries via API (POST /api/v1/query)
+        does require a paid plan and will return 402.
+
+        Args:
+            query_id: numeric ID from the Dune query URL (dune.com/queries/ID)
+            params:   dict of parameter name → value (all passed as text type)
+            name:     label used in log messages only
+        """
+        if not HAS_DUNE_CLIENT:
+            raise ImportError("dune-client is required. pip install dune-client")
+
+        from dune_client.query import QueryBase
+        from dune_client.types import QueryParameter
+
+        logger.info(f"Executing Dune query {query_id}: {name}")
+
+        dune_params = [
+            QueryParameter.text_type(k, str(v))
+            for k, v in params.items()
+        ]
+
+        try:
+            result = self.client.run_query_dataframe(
+                QueryBase(query_id=query_id, params=dune_params)
+            )
+            logger.info(f"Got {len(result)} rows from query {query_id}")
+            return result
+        except Exception as e:
+            logger.error(f"Dune API execution failed: {e}")
+            raise
 
     def execute_sql(
         self,
@@ -77,34 +122,32 @@ class DuneRunner:
         name: str = "pumpfun_query",
     ) -> pd.DataFrame:
         """
-        Create a query on Dune, execute it, and return results as DataFrame.
-        Costs API credits (~10 per medium execution).
+        DEPRECATED on free tier — POST /api/v1/query returns 402.
+        Kept for paid-plan users or backward compatibility.
+        Use run_saved_query() instead.
         """
         rendered = self._render_sql(sql_template, params)
-        logger.info(f"Executing Dune query: {name} ({len(rendered)} chars)")
+        logger.info(f"Executing Dune query (via create): {name} ({len(rendered)} chars)")
+        logger.warning(
+            "execute_sql() creates a new query via API, which requires a paid Dune plan. "
+            "If you see 402 errors, use run_saved_query() instead."
+        )
 
         try:
+            from dune_client.query import QueryBase
             query = self.client.create_query(
                 name=f"[pumpfun-research] {name}",
                 query_sql=rendered,
                 is_private=True,
             )
             query_id = query.base.query_id
-            logger.info(f"Created query ID: {query_id}")
-
-            result = self.client.run_query_dataframe(
-                QueryBase(query_id=query_id)
-            )
-
-            # Clean up the query to not clutter the account
+            result = self.client.run_query_dataframe(QueryBase(query_id=query_id))
             try:
                 self.client.archive_query(query_id)
             except Exception:
                 pass
-
             logger.info(f"Got {len(result)} rows from Dune")
             return result
-
         except Exception as e:
             logger.error(f"Dune API execution failed: {e}")
             raise
