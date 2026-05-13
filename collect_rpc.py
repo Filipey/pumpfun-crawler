@@ -24,7 +24,9 @@ Usage
 import argparse
 import datetime
 import logging
+import logging.handlers
 import sys
+import time
 from typing import Callable
 
 from config import (
@@ -41,11 +43,38 @@ from collectors.rpc_client import SolanaRPC
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+_LOG_FMT  = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
+_DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def _setup_logging() -> None:
+    from config import DATA_DIR
+
+    log_dir = DATA_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "crawler.log"
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    # Console — INFO and above
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter(_LOG_FMT, _DATE_FMT))
+
+    # Rotating file — DEBUG and above; 10 MB per file, keep last 10 files
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(logging.Formatter(_LOG_FMT, _DATE_FMT))
+
+    root.addHandler(console)
+    root.addHandler(file_handler)
+
+    logging.getLogger("collect_rpc").info(f"Log file: {log_path}")
+
+
 logger = logging.getLogger("collect_rpc")
 
 
@@ -90,8 +119,12 @@ def _collect_program(
     if cursor:
         logger.info(f"[{label}] Resuming from cursor {cursor[:16]}…")
 
-    total_events = 0
+    total_events  = 0
+    total_pages   = 0
+    days_done     = 0
     active_day: str | None = None
+    t_start       = time.monotonic()
+    t_last_log    = t_start      # rate-limit progress lines to ~every 15s
 
     while True:
         page = rpc.get_signatures_for_address(address=program, before=cursor)
@@ -101,6 +134,7 @@ def _collect_program(
             _flush_pending(label, store, checkpoint, todo_days)
             break
 
+        total_pages  += 1
         oldest_ts = page[-1].get("blockTime") or 0
         newest_ts = page[0].get("blockTime") or 0
 
@@ -134,9 +168,9 @@ def _collect_program(
             sigs = [r["signature"] for r in in_window]
             txs  = rpc.get_transactions(sigs)
             for sig_row, tx in zip(in_window, txs):
-                sig    = sig_row["signature"]
-                bt     = sig_row.get("blockTime") or 0
-                date   = _date_of(bt) if bt else "unknown"
+                sig  = sig_row["signature"]
+                bt   = sig_row.get("blockTime") or 0
+                date = _date_of(bt) if bt else "unknown"
                 if date not in todo_days:
                     continue
                 events = decoder(tx, sig)
@@ -154,21 +188,36 @@ def _collect_program(
             if active_day in todo_days and not checkpoint.is_done(active_day):
                 rows = store.flush_day(active_day)
                 checkpoint.mark_done(active_day)
+                days_done += 1
+                remaining = len(todo_days) - days_done
+                elapsed   = time.monotonic() - t_start
+                ev_s      = total_events / elapsed if elapsed > 0 else 0
                 logger.info(
-                    f"[{label}] Day {active_day} complete "
-                    f"({rows:,} rows, total events so far: {total_events:,})."
+                    f"[{label}] DONE day={active_day} "
+                    f"rows={rows:,} | "
+                    f"total_events={total_events:,} | "
+                    f"speed={ev_s:,.0f} ev/s | "
+                    f"days_remaining={remaining}"
                 )
 
         active_day = new_cursor_day
         cursor     = new_cursor
         set_cursor(cursor)
 
-        buffered = store.buffered_rows()
-        buf_tail = ", ".join(f"{d}:{n}" for d, n in sorted(buffered.items())[-3:])
-        logger.info(
-            f"[{label}] cursor={cursor[:16]}… day={active_day} "
-            f"buf=[{buf_tail}] events={total_events:,}"
-        )
+        # Progress line — rate-limited to once every 15 seconds
+        now = time.monotonic()
+        if now - t_last_log >= 15:
+            elapsed = now - t_start
+            ev_s    = total_events / elapsed if elapsed > 0 else 0
+            logger.info(
+                f"[{label}] "
+                f"date={active_day} | "
+                f"pages={total_pages:,} | "
+                f"events={total_events:,} | "
+                f"speed={ev_s:,.0f} ev/s | "
+                f"days_done={days_done}/{len(todo_days)}"
+            )
+            t_last_log = now
 
         if new_cursor_ts and new_cursor_ts < start_ts:
             logger.info(f"[{label}] Passed start boundary. Done.")
@@ -311,6 +360,8 @@ def status(start: str, end: str) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _setup_logging()
+
     parser = argparse.ArgumentParser(
         description="pump.fun + PumpSwap Solana RPC crawler."
     )
