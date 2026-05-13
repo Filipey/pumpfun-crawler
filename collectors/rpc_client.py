@@ -35,7 +35,6 @@ class SolanaRPC:
         if not self._endpoints:
             raise ValueError("No RPC endpoints configured.")
         self._lock = threading.Lock()
-        self._idx  = 0
         # unix-monotonic timestamp until which each endpoint is in 429 cooldown
         self._cooldown_until: dict[str, float] = {}
         self._session = requests.Session()
@@ -52,20 +51,20 @@ class SolanaRPC:
 
     def _next(self) -> str:
         """
-        Return the next endpoint that is not in 429 cooldown.
+        Return the first endpoint in the list that is not in 429 cooldown.
+        Endpoints are tried in declaration order (primary → fallback), so put
+        your best endpoint first in RPC_ENDPOINTS.
+
         If every endpoint is cooling down, sleep until the soonest one recovers.
         """
         with self._lock:
-            n   = len(self._endpoints)
             now = time.monotonic()
 
-            for i in range(n):
-                ep = self._endpoints[self._idx % n]
-                self._idx += 1
+            for ep in self._endpoints:
                 if self._cooldown_until.get(ep, 0) <= now:
                     return ep
 
-            # All endpoints are cooling — find the one that recovers soonest
+            # All endpoints are cooling — wait for the soonest recovery
             ep   = min(self._endpoints, key=lambda e: self._cooldown_until.get(e, 0))
             wait = max(0.0, self._cooldown_until[ep] - now)
 
