@@ -1,17 +1,20 @@
 """
 collectors/checkpoint.py
 ------------------------
-Thread-safe checkpoint that persists progress to a JSONL file.
+Thread-safe, day-level checkpoint backed by a JSON file.
 
-Each line is a JSON record:  {"mint": "...", "status": "done"|"error", "ts": unix}
+Tracks which calendar days have been fully collected so that the crawler
+can resume without re-fetching already-processed data.
 
-The checkpoint keeps a fast in-memory set of completed mints so resume is O(1).
+States per day:
+  "done"     → all transactions for this day have been fetched, decoded,
+                and written to Parquet
+  "partial"  → collection started but not yet complete (e.g. process killed)
 """
 
 import json
 import logging
 import threading
-import time
 from pathlib import Path
 
 from config import CHECKPOINT_PATH
@@ -23,58 +26,91 @@ class Checkpoint:
     def __init__(self, path: Path = CHECKPOINT_PATH):
         self.path = path
         self._lock = threading.Lock()
-        self._done: set[str] = set()
-        self._errors: set[str] = set()
-        self._load()
+        self._data: dict = self._load()
 
-    def _load(self) -> None:
-        if not self.path.exists():
-            return
-        with open(self.path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    mint = rec.get("mint", "")
-                    if rec.get("status") == "done":
-                        self._done.add(mint)
-                    elif rec.get("status") == "error":
-                        self._errors.add(mint)
-                except json.JSONDecodeError:
-                    pass
-        logger.info(f"Checkpoint loaded: {len(self._done)} done, {len(self._errors)} errors")
+    def _load(self) -> dict:
+        if self.path.exists():
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                logger.info(
+                    f"Checkpoint loaded: "
+                    f"{len(data.get('done', []))} done days, "
+                    f"cursor={data.get('cursor')}"
+                )
+                return data
+            except Exception as exc:
+                logger.warning(f"Could not read checkpoint: {exc}. Starting fresh.")
+        return {"done": [], "partial": [], "cursor": None, "pumpswap_cursor": None}
 
-    def is_done(self, mint: str) -> bool:
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, indent=2)
+        tmp.replace(self.path)
+
+    # ── Day status ────────────────────────────────────────────────────────────
+
+    def is_done(self, date: str) -> bool:
         with self._lock:
-            return mint in self._done
+            return date in self._data["done"]
 
-    def mark_done(self, mint: str) -> None:
+    def mark_done(self, date: str) -> None:
         with self._lock:
-            self._done.add(mint)
-            self._errors.discard(mint)
-            self._append({"mint": mint, "status": "done", "ts": int(time.time())})
+            done = self._data.setdefault("done", [])
+            partial = self._data.setdefault("partial", [])
+            if date not in done:
+                done.append(date)
+            if date in partial:
+                partial.remove(date)
+            self._save()
 
-    def mark_error(self, mint: str, reason: str = "") -> None:
+    def mark_partial(self, date: str) -> None:
         with self._lock:
-            self._errors.add(mint)
-            self._append({"mint": mint, "status": "error", "reason": reason, "ts": int(time.time())})
+            partial = self._data.setdefault("partial", [])
+            if date not in partial:
+                partial.append(date)
+            self._save()
 
-    def _append(self, record: dict) -> None:
-        with open(self.path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
+    # ── Pagination cursor ─────────────────────────────────────────────────────
 
     @property
-    def done_count(self) -> int:
+    def cursor(self) -> str | None:
+        """Last pump.fun bonding curve signature processed."""
         with self._lock:
-            return len(self._done)
+            return self._data.get("cursor")
+
+    def set_cursor(self, signature: str | None) -> None:
+        with self._lock:
+            self._data["cursor"] = signature
+            self._save()
 
     @property
-    def error_count(self) -> int:
+    def pumpswap_cursor(self) -> str | None:
+        """Last PumpSwap AMM signature processed."""
         with self._lock:
-            return len(self._errors)
+            return self._data.get("pumpswap_cursor")
+
+    def set_pumpswap_cursor(self, signature: str | None) -> None:
+        with self._lock:
+            self._data["pumpswap_cursor"] = signature
+            self._save()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+
+    @property
+    def done_days(self) -> list[str]:
+        with self._lock:
+            return sorted(self._data.get("done", []))
 
     def summary(self) -> str:
         with self._lock:
-            return f"done={len(self._done)}, errors={len(self._errors)}"
+            n_done      = len(self._data.get("done", []))
+            n_partial   = len(self._data.get("partial", []))
+            cursor      = self._data.get("cursor", "none")
+            ps_cursor   = self._data.get("pumpswap_cursor", "none")
+        return (
+            f"done={n_done} days, partial={n_partial}, "
+            f"pumpfun_cursor={cursor}, pumpswap_cursor={ps_cursor}"
+        )

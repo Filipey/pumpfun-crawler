@@ -1,7 +1,8 @@
 """
 config.py
 ---------
-Central configuration. Copy .env.example to .env and fill in values.
+Central configuration for the Solana RPC-based pump.fun crawler.
+Copy .env.example to .env and fill in values.
 """
 
 import os
@@ -11,30 +12,31 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Time window ───────────────────────────────────────────────────────────────
-COLLECT_START: str = "2026-01-01"   # inclusive ISO date
-COLLECT_END:   str = "2026-05-12"   # inclusive ISO date
+# ── Collection window ─────────────────────────────────────────────────────────
+COLLECT_START: str = os.getenv("COLLECT_START", "2026-01-01")
+COLLECT_END:   str = os.getenv("COLLECT_END",   "2026-05-12")
 
-# ── pump.fun REST API ─────────────────────────────────────────────────────────
-PUMPFUN_API_BASE: str  = "https://frontend-api.pump.fun"
-PUMPFUN_PAGE_SIZE: int = 50          # max coins per /coins request
-TRADES_PAGE_SIZE: int  = 200         # max trades per /trades/all request
+# ── Solana programs ───────────────────────────────────────────────────────────
+PUMPFUN_PROGRAM:  str = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMPSWAP_PROGRAM: str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 
-# ── Sampling thresholds ───────────────────────────────────────────────────────
-# Non-graduated tokens with trade_count > ACTIVITY_THRESHOLD get full trade history.
-# Those at or below only get creation row + final state snapshot.
-ACTIVITY_THRESHOLD: int = 10
+# ── Solana RPC endpoints ──────────────────────────────────────────────────────
+# Add more endpoints to rotate between them and increase throughput.
+# Helius free tier: https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+# QuickNode free:   https://YOUR_NAME.solana-mainnet.quiknode.pro/YOUR_KEY/
+_raw_endpoints = os.getenv(
+    "RPC_ENDPOINTS",
+    "https://api.mainnet-beta.solana.com",
+)
+RPC_ENDPOINTS: list[str] = [e.strip() for e in _raw_endpoints.split(",") if e.strip()]
 
-# ── HTTP client ───────────────────────────────────────────────────────────────
-MAX_RETRIES: int        = 6
-RETRY_BACKOFF: float    = 1.5   # exponential base (seconds)
-REQUEST_TIMEOUT: int    = 30    # seconds per request
-RATE_LIMIT_RPS: float   = 5.0   # max requests per second (conservative)
-
-# ── Concurrency ───────────────────────────────────────────────────────────────
-# Parallel workers for token processing (each worker fetches independently).
-# 4–8 is a sweet spot for a single machine; increase carefully.
-WORKERS: int = int(os.getenv("WORKERS", "4"))
+# ── RPC tuning ────────────────────────────────────────────────────────────────
+RPC_TIMEOUT:       int   = 60     # seconds per request
+MAX_RETRIES:       int   = 6
+RETRY_BACKOFF:     float = 1.5    # exponential base (seconds)
+SIGNATURES_LIMIT:  int   = 1000   # max sigs per getSignaturesForAddress call
+TX_BATCH_SIZE:     int   = 100    # signatures per getTransaction batch call
+WORKERS:           int   = int(os.getenv("WORKERS", "4"))
 
 # ── Storage ───────────────────────────────────────────────────────────────────
 DATA_DIR:    Path = Path(os.getenv("DATA_DIR", "./data"))
@@ -44,5 +46,5 @@ PARQUET_DIR: Path = DATA_DIR / "parquet"
 for _d in [RAW_DIR, PARQUET_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
-# ── Checkpoint ───────────────────────────────────────────────────────────────
-CHECKPOINT_PATH: Path = DATA_DIR / "checkpoint.jsonl"
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+CHECKPOINT_PATH: Path = DATA_DIR / "checkpoint.json"

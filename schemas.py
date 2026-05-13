@@ -1,66 +1,74 @@
 """
 schemas.py
 ----------
-Column definitions and dtype maps for all Parquet outputs.
+Column definitions matching the paper's dataset schema (Section IV).
+
+Reference:
+  Marino et al. (2026), "Predicting the success of new crypto-tokens: the Pump.fun case"
+  arXiv:2602.14860 — Table on page 7-8.
 """
 
 import pandas as pd
 
-# ── Token record (one row per token) ─────────────────────────────────────────
-TOKEN_DTYPES: dict = {
-    "mint":                    "str",
-    "name":                    "str",
-    "symbol":                  "str",
-    "description":             "str",
-    "image_uri":               "str",
-    "metadata_uri":            "str",
-    "creator":                 "str",
-    "created_timestamp":       "Int64",   # unix ms
-    "complete":                "bool",    # graduated to Raydium?
-    "raydium_pool":            "str",     # pool address if graduated
-    "bonding_curve":           "str",
-    "associated_bonding_curve": "str",
-    "usd_market_cap":          "float64",
-    "virtual_sol_reserves":    "Int64",
-    "virtual_token_reserves":  "Int64",
-    "real_sol_reserves":       "Int64",
-    "real_token_reserves":     "Int64",
-    "total_supply":            "Int64",
-    "reply_count":             "Int64",
-    "last_reply":              "Int64",   # unix ms
-    "nsfw":                    "bool",
-    "market_id":               "str",
-    "inverted":                "bool",
-    "is_currently_live":       "bool",
-    "king_of_the_hill_timestamp": "Int64",
-    "trade_count":             "Int64",   # derived during collection
-    "category":                "str",     # "graduated" | "active" | "dead"
-    "collected_at":            "Int64",   # unix ms when we fetched it
-}
+# One row per on-chain event (create / buy / sell / complete).
+# Matches the paper's per-transaction record structure.
+TX_DTYPES: dict = {
+    # ── Identity ──────────────────────────────────────────────────────────────
+    "signature":    "str",    # unique transaction hash
+    "slot":         "Int64",  # Solana slot number
+    "timestamp":    "Int64",  # unix seconds (blockchain time)
+    "date":         "str",    # YYYY-MM-DD (derived, for partitioning)
 
-# ── Trade record (one row per trade) ─────────────────────────────────────────
-TRADE_DTYPES: dict = {
-    "signature":     "str",
-    "mint":          "str",
-    "sol_amount":    "Int64",   # lamports
-    "token_amount":  "Int64",   # raw token units
-    "is_buy":        "bool",
-    "user":          "str",     # wallet address
-    "timestamp":     "Int64",   # unix seconds
-    "tx_index":      "Int64",
-    "username":      "str",     # optional social name
-    "profile_image": "str",
+    # ── Token ─────────────────────────────────────────────────────────────────
+    "mint":         "str",    # token mint address
+    "coin_creator": "str",    # creator wallet (from CreateEvent; NULL in trades)
+    "bonding_curve":"str",    # bonding curve PDA address
+
+    # ── Participants ──────────────────────────────────────────────────────────
+    "trader":       "str",    # wallet executing the trade (user field in events)
+
+    # ── Transaction type ──────────────────────────────────────────────────────
+    "tx_type":      "str",    # "create" | "buy" | "sell" | "complete"
+    "is_buy":       "bool",   # True for buy, False for sell, None for create/complete
+
+    # ── Bonding curve state AFTER the transaction ─────────────────────────────
+    "in_bonding_curve":          "bool",   # always True for pump.fun launchpad events
+    "v_sol_in_bonding_curve":    "Int64",  # virtual SOL reserves (lamports)
+    "v_tok_in_bonding_curve":    "Int64",  # virtual token reserves (raw units)
+
+    # ── Trade amounts ─────────────────────────────────────────────────────────
+    "sol_amount":   "Int64",  # SOL exchanged (lamports)
+    "token_amount": "Int64",  # tokens exchanged (raw units)
+
+    # ── Bot detection (paper Section IV) ──────────────────────────────────────
+    # True  = direct contract invocation (bypasses frontend) → likely bot
+    # False = invoked through pump.fun dApp interface → likely human
+    # None  = could not determine
+    "is_bot":       "bool",
+
+    # ── Data source ───────────────────────────────────────────────────────────
+    # "pumpfun"   = bonding curve (launchpad) event
+    # "pumpswap"  = PumpSwap AMM event (post-graduation)
+    "source":       "str",
+
+    # ── PumpSwap-specific ─────────────────────────────────────────────────────
+    "pool":             "str",    # PumpSwap pool address (NULL for bonding curve)
+    "lp_fee":           "Int64",  # LP fee paid (lamports; NULL for bonding curve)
+    "protocol_fee":     "Int64",  # protocol fee paid (lamports)
+    "coin_creator_fee": "Int64",  # creator revenue share (lamports)
 }
 
 
 def apply_dtypes(df: pd.DataFrame, dtype_map: dict) -> pd.DataFrame:
-    """Cast DataFrame columns to the specified dtypes, ignoring missing cols."""
+    """Cast DataFrame columns to the specified dtypes; silently skip missing cols."""
     for col, dtype in dtype_map.items():
         if col not in df.columns:
             continue
         try:
             if dtype == "bool":
-                df[col] = df[col].fillna(False).astype(bool)
+                df[col] = df[col].where(df[col].notna(), None)
+                non_null = df[col].notna()
+                df.loc[non_null, col] = df.loc[non_null, col].astype(bool)
             elif dtype == "str":
                 df[col] = df[col].where(df[col].notna(), None).astype("object")
             else:

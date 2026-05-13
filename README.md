@@ -1,90 +1,72 @@
-# pumpfun-crawler
+# pump.fun + PumpSwap RPC Crawler
 
-A **fully local** data collection pipeline for [pump.fun](https://pump.fun) (Solana memecoin launchpad), supporting academic research on pump-and-dump schemes, memecoin taxonomy, creator influence networks, and trader behavior modeling via Inverse Reinforcement Learning.
+Collects all on-chain events from both pump.fun phases directly from Solana via JSON-RPC and saves them as **day-partitioned Parquet files**:
+
+- **Phase 1 — Bonding curve** (`6EF8…`): token creates, buys, sells, graduations
+- **Phase 2 — PumpSwap AMM** (`pAMM…`): pool creation, AMM buys/sells post-graduation
+
+Replicates the bonding curve dataset described in:
+
+> Marino et al. (2026), *"Predicting the success of new crypto-tokens: the Pump.fun case"*, arXiv:2602.14860
 
 > **Institution**: UFMG — Departamento de Ciência da Computação, LOCUS (Social Computing Laboratory)
 
 ---
 
-## Table of Contents
+## How it works
 
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Token Classification](#token-classification)
-4. [Quick Start](#quick-start)
-5. [Configuration](#configuration)
-6. [Output Schema](#output-schema)
-7. [Running as a Service](#running-as-a-service)
-8. [Estimated Scale](#estimated-scale)
-9. [Optional: Dune Analytics Cross-Validation](#optional-dune-analytics-cross-validation)
+```
+┌─ pump.fun launchpad (6EF8…) ──────────────────┐
+│ getSignaturesForAddress → paginate backward    │
+│ getTransaction (batched 100/call)              │
+│ Anchor decoder: CreateEvent, TradeEvent,       │
+│                 CompleteEvent                  │
+└───────────────────────────────────────────────┘
+                    │
+                    ▼
+┌─ PumpSwap AMM (pAMM…) ────────────────────────┐
+│ getSignaturesForAddress → paginate backward    │
+│ getTransaction (batched 100/call)              │
+│ Anchor decoder: CreatePoolEvent,               │
+│                 BuyEvent, SellEvent            │
+└───────────────────────────────────────────────┘
+                    │
+                    ▼
+         DayStore (dedup + merge)
+                    │
+                    ▼
+  data/parquet/transactions_YYYY-MM-DD.parquet
+```
+
+The crawler paginates **newest → oldest** for each program, flushing a day's Parquet file as soon as the cursor crosses into the previous day. You can analyse completed days while collection is still running.
+
+Both programs share the same output files — the `source` column (`"pumpfun"` / `"pumpswap"`) distinguishes them.
 
 ---
 
-## Overview
-
-**Data source**: The unofficial but stable pump.fun REST API (`https://frontend-api.pump.fun`).
-No authentication required. No API key needed. No rate-limit quotas to worry about.
-
-**Collection window**: January 1 – May 12, 2026 (132 days).
-
-**What gets collected**:
-
-| Category | Condition | Data collected |
-|---|---|---|
-| `graduated` | `token.complete == true` | Full metadata + **all trades** |
-| `active` | `complete == false`, trade count > 10 | Full metadata + **all trades** |
-| `dead` | `complete == false`, trade count ≤ 10 | Metadata row only (creation + final state) |
-
-The threshold of 10 trades balances storage cost against analytical value: tokens with ≤ 10 trades carry almost no behavioral signal for IRL or network analysis.
-
----
-
-## Architecture
+## Project layout
 
 ```
-collect.py  (main CLI)
-│
-├── collectors/discovery.py       Paginate /coins DESC; yield tokens in window
-├── collectors/api_client.py      HTTP client: rate limiting + exponential backoff
-├── collectors/token_processor.py Enrich + classify + fetch trades per token
-├── collectors/checkpoint.py      JSONL checkpoint (resume from interruption)
-├── collectors/storage.py         Thread-safe incremental Parquet writer
-│
-config.py                         Constants, env overrides
-schemas.py                        Column definitions + dtype casts
-```
-
-**Concurrency model**: One discovery loop feeds a bounded `queue.Queue`; `WORKERS` parallel threads each own an independent HTTP session and pull from the queue. The storage layer is protected by a single mutex and auto-flushes every 5 000 rows.
-
-```
-Main thread                   Worker threads (WORKERS=4)
-────────────────────          ──────────────────────────────
-discover_tokens()             worker-0: process_token()
-  → yield token dicts           → get_coin(mint)
-  → queue.put(token)            → get_all_trades(mint)
-                                → store.add_token/add_trades()
-                              worker-1 … worker-N (same)
+collect_rpc.py              Main CLI entry point
+config.py                   Constants and env-var overrides
+schemas.py                  Column definitions + dtype casts
+collectors/
+  rpc_client.py             Solana JSON-RPC client (batching + retry + rotation)
+  decoder.py                Anchor event decoders for both programs (Borsh + base58)
+  day_store.py              Day-partitioned Parquet writer with dedup + enrichment
+  checkpoint.py             JSON-backed resume state (two cursors + done days)
+data/
+  parquet/
+    transactions_2026-01-01.parquet   ← one file per day (both sources)
+    …
+    mint_creators.parquet             ← mint → coin_creator (bonding curve join)
+    pool_mints.parquet                ← pool address → mint (PumpSwap join)
+  checkpoint.json                     ← pumpfun_cursor, pumpswap_cursor, done days
 ```
 
 ---
 
-## Token Classification
-
-pump.fun bonding curve mechanics:
-
-```
-y = 1,073,000,191 − 32,190,005,730 / (30 + x)   where x = SOL in pool
-BCP = 100 − ((token_reserve − 206,900,000) × 100 / 793,100,000)
-```
-
-A token **graduates** (becomes `complete = true`) when the bonding curve fills to ~85 SOL (≈ $69 k market cap at ~$130/SOL), triggering migration to Raydium. About 2 % of all tokens graduate. The remaining 98 % are split:
-
-- **Active non-grads**: had real trading activity (> 10 trades) — essential for modeling failed P&D attempts.
-- **Dead tokens**: near-zero activity, created speculatively or as spam — useful for taxonomy but not for behavioral models.
-
----
-
-## Quick Start
+## Quick start
 
 ```bash
 # 1. Clone and install
@@ -93,92 +75,145 @@ cd pumpfun-crawler
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. (Optional) copy env file and override defaults
+# 2. Configure RPC endpoint
 cp .env.example .env
-# edit .env if needed (all settings have sensible defaults)
+# Edit .env — set RPC_ENDPOINTS (see below)
 
-# 3. Run the crawler
-python collect.py
+# 3. Smoke-test with a single day
+python collect_rpc.py --day 2026-05-01
 
-# 4. Check progress at any time (without interrupting the run)
-python collect.py --status
+# 4. Full run (both programs, Jan 1 – May 12 2026)
+python collect_rpc.py
 ```
 
-To resume after interruption, just run `python collect.py` again — the checkpoint skips already-processed tokens automatically.
+---
+
+## Getting a free RPC endpoint
+
+The public endpoint (`https://api.mainnet-beta.solana.com`) is heavily rate-limited. For real collection you need at least one dedicated endpoint.
+
+**Helius** (recommended) — free tier gives ~100 req/s:
+1. Sign up at https://dev.helius.xyz
+2. Create a Mainnet API key
+3. Add to `.env`:
+   ```
+   RPC_ENDPOINTS=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY
+   ```
+
+Multiple endpoints (comma-separated) are rotated round-robin for higher throughput:
+```
+RPC_ENDPOINTS=https://mainnet.helius-rpc.com/?api-key=KEY1,https://api.mainnet-beta.solana.com
+```
+
+---
+
+## Running
+
+```bash
+# Full collection — both pump.fun and PumpSwap
+python collect_rpc.py
+
+# Check progress without collecting
+python collect_rpc.py --status
+
+# Single day only (good for smoke-testing)
+python collect_rpc.py --day 2026-05-01
+
+# Only one program
+python collect_rpc.py --program pumpfun
+python collect_rpc.py --program pumpswap
+
+# Custom date range
+python collect_rpc.py --start 2026-03-01 --end 2026-03-31
+
+# More parallel decode workers
+python collect_rpc.py --workers 8
+```
+
+The crawler is **safe to interrupt** (Ctrl-C). Each program's cursor is saved independently in `data/checkpoint.json`. Restart with the same command to resume where it stopped.
 
 ---
 
 ## Configuration
 
-All options have defaults in `config.py`. Override via environment variables or `.env`:
+All options have defaults in `config.py`. Override via `.env`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `COLLECT_START` | `2026-01-01` | Start of collection window (ISO date, inclusive) |
-| `COLLECT_END` | `2026-05-12` | End of collection window (ISO date, inclusive) |
-| `WORKERS` | `4` | Parallel worker threads |
+| `RPC_ENDPOINTS` | public endpoint | Comma-separated RPC URLs |
+| `COLLECT_START` | `2026-01-01` | Start of collection window (inclusive) |
+| `COLLECT_END` | `2026-05-12` | End of collection window (inclusive) |
+| `WORKERS` | `4` | Parallel decode workers |
 | `DATA_DIR` | `./data` | Root directory for all output |
 
-**Tuning `WORKERS`**:
-- 4 workers: ~3–5 req/s sustained, safe for long overnight runs
-- 8 workers: ~6–10 req/s, finishes faster, slight risk of hitting informal rate limits
-- Do not exceed 16 — the pump.fun API will start returning 429s
-
 ---
 
-## Output Schema
+## Output schema
 
-All output is written to `data/parquet/`.
-
-### `tokens.parquet`
-
-One row per token mint. Columns (selected):
+One row per on-chain event. Bonding curve columns match the paper (§IV); PumpSwap columns are additive.
 
 | Column | Type | Description |
 |---|---|---|
-| `mint` | str | Token mint address (primary key) |
-| `name` | str | Token name |
-| `symbol` | str | Token symbol |
-| `description` | str | Creator description |
-| `image_uri` | str | IPFS/CDN image URL |
-| `creator` | str | Creator wallet address |
-| `created_timestamp` | Int64 | Unix ms — token creation time |
-| `complete` | bool | `True` if graduated to Raydium |
-| `raydium_pool` | str | Raydium pool address (if graduated) |
-| `usd_market_cap` | float64 | Market cap in USD at collection time |
-| `virtual_sol_reserves` | Int64 | SOL in bonding curve (lamports) |
-| `virtual_token_reserves` | Int64 | Tokens in bonding curve (raw) |
-| `trade_count` | Int64 | Total trade count |
-| `category` | str | `"graduated"` / `"active"` / `"dead"` |
-| `collected_at` | Int64 | Unix ms when we fetched it |
-
-### `trades_graduated.parquet` / `trades_active.parquet`
-
-One row per trade. Columns:
-
-| Column | Type | Description |
-|---|---|---|
-| `signature` | str | Transaction signature (primary key) |
+| `signature` | str | Transaction hash |
+| `slot` | Int64 | Solana slot number |
+| `timestamp` | Int64 | Unix seconds (block time) |
+| `date` | str | YYYY-MM-DD (partition key) |
+| `source` | str | `"pumpfun"` or `"pumpswap"` |
 | `mint` | str | Token mint address |
-| `sol_amount` | Int64 | SOL amount in lamports |
-| `token_amount` | Int64 | Token amount in raw units |
-| `is_buy` | bool | `True` = buy, `False` = sell |
-| `user` | str | Trader wallet address |
-| `timestamp` | Int64 | Unix seconds |
-| `tx_index` | Int64 | Transaction index in block |
-| `username` | str | Optional social handle |
-| `profile_image` | str | Optional profile image URL |
+| `coin_creator` | str | Creator wallet |
+| `bonding_curve` | str | Bonding curve PDA (NULL for PumpSwap rows) |
+| `pool` | str | PumpSwap pool address (NULL for bonding curve rows) |
+| `trader` | str | Wallet executing the trade |
+| `tx_type` | str | `create` / `buy` / `sell` / `complete` / `pool_create` |
+| `is_buy` | bool | True=buy, False=sell, None=create/complete |
+| `in_bonding_curve` | bool | True for bonding curve events, False for PumpSwap |
+| `v_sol_in_bonding_curve` | Int64 | SOL reserves after tx (lamports) |
+| `v_tok_in_bonding_curve` | Int64 | Token reserves after tx (raw units) |
+| `sol_amount` | Int64 | SOL exchanged (lamports) |
+| `token_amount` | Int64 | Tokens exchanged (raw units) |
+| `is_bot` | bool | True if invoked at depth [1] (direct call, likely bot) |
+| `lp_fee` | Int64 | LP fee in lamports (PumpSwap only) |
+| `protocol_fee` | Int64 | Protocol fee in lamports (PumpSwap only) |
+| `coin_creator_fee` | Int64 | Creator revenue share per trade (PumpSwap only) |
+
+### Side tables
+
+| File | Key | Description |
+|---|---|---|
+| `mint_creators.parquet` | `mint` | mint → creator wallet; join to fill `coin_creator` in bonding curve trade rows |
+| `pool_mints.parquet` | `pool` | pool address → mint; join to fill `mint` in PumpSwap rows where the pool was created outside the collection window |
+
+### Enrichment example
+
+```python
+import pandas as pd
+
+day = pd.read_parquet("data/parquet/transactions_2026-03-15.parquet")
+
+# Fill coin_creator on bonding curve trades
+creators = pd.read_parquet("data/parquet/mint_creators.parquet")
+day = day.merge(creators, on="mint", how="left", suffixes=("", "_mc"))
+day["coin_creator"] = day["coin_creator"].fillna(day["coin_creator_mc"])
+day.drop(columns=["coin_creator_mc"], inplace=True)
+
+# Fill mint on PumpSwap rows (if pool pre-dates collection window)
+pool_mints = pd.read_parquet("data/parquet/pool_mints.parquet")
+pumpswap = day["source"] == "pumpswap"
+day = day.merge(pool_mints.rename(columns={"mint": "mint_pm"}), on="pool", how="left")
+day.loc[pumpswap & day["mint"].isna(), "mint"] = day["mint_pm"]
+day.drop(columns=["mint_pm"], inplace=True)
+```
 
 ---
 
-## Running as a Service
+## Running as a service
 
-### tmux (interactive, recommended during first run)
+### tmux (recommended during initial run)
 
 ```bash
 tmux new -s pumpfun
-source /path/to/.venv/bin/activate
-python collect.py
+source .venv/bin/activate
+python collect_rpc.py
 # Ctrl+B D to detach; tmux attach -t pumpfun to reattach
 ```
 
@@ -187,14 +222,14 @@ python collect.py
 ```ini
 # /etc/systemd/system/pumpfun-crawler.service
 [Unit]
-Description=pump.fun data crawler
+Description=pump.fun + PumpSwap RPC crawler
 After=network.target
 
 [Service]
 Type=simple
 User=filipe
 WorkingDirectory=/home/filipe/Pesquisas/Mestrado/pumpfun-crawler
-ExecStart=/home/filipe/Pesquisas/Mestrado/pumpfun-crawler/.venv/bin/python collect.py
+ExecStart=/home/filipe/Pesquisas/Mestrado/pumpfun-crawler/.venv/bin/python collect_rpc.py
 Restart=on-failure
 RestartSec=30
 
@@ -205,90 +240,65 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl enable pumpfun-crawler
 sudo systemctl start pumpfun-crawler
-journalctl -u pumpfun-crawler -f  # follow logs
-```
-
-### cron (scheduled, e.g. restart daily)
-
-```bash
-# crontab -e
-# Restart every day at 6 AM; flock prevents overlapping runs
-0 6 * * * flock -n /tmp/pumpfun.lock /home/filipe/Pesquisas/Mestrado/pumpfun-crawler/.venv/bin/python /home/filipe/Pesquisas/Mestrado/pumpfun-crawler/collect.py >> /home/filipe/Pesquisas/Mestrado/pumpfun-crawler/logs/cron.log 2>&1
+journalctl -u pumpfun-crawler -f   # follow logs
 ```
 
 ---
 
-## Estimated Scale
+## Estimated scale (Jan 1 – May 12, 2026)
 
-| Window | Est. tokens | Graduated | Active non-grad | Dead |
-|---|---|---|---|---|
-| Jan 1 – May 12, 2026 (132 days) | ~3.4 M | ~66 k (2%) | ~700 k (20%) | ~2.6 M (78%) |
+Based on the paper's September 2025 figures (~2–5M bonding curve trades/day):
 
-Approximate storage:
+| Program | Events/day | 132-day total | Est. Parquet (zstd) |
+|---|---|---|---|
+| pump.fun bonding curve | ~2–5M | ~260M–660M | ~50–200 GB |
+| PumpSwap AMM | ~200k–1M | ~26M–132M | ~5–30 GB |
 
-| File | Rows | Est. size |
-|---|---|---|
-| `tokens.parquet` | ~3.4 M | ~2 GB |
-| `trades_graduated.parquet` | ~50–200 M | ~20–80 GB |
-| `trades_active.parquet` | ~30–100 M | ~12–40 GB |
-
-Runtime at 4 workers (conservative estimate): **3–7 days** for the full window.
+Approximate runtime at 10 req/s (Helius free tier): **3–10 days** for both programs.
 
 ---
 
-## Optional: Dune Analytics Cross-Validation
+## isBot detection
 
-These SQL queries are provided for **one-time manual validation only** — run them in the [Dune IDE](https://dune.com/queries) and compare counts against your local data. No API key or automation needed.
+Applies independently to each program:
 
-### Graduated tokens (migrations to Raydium) — Jan 1 to May 12, 2026
+- `is_bot = True` — program invoked at log depth `[1]` (direct call, no outer program) → likely bot
+- `is_bot = False` — invoked at depth `[2]+` (through another program / dApp router) → likely human
+- `is_bot = None` — depth not found in logs
+
+---
+
+## Optional: Dune cross-validation
+
+Copy-paste into the [Dune IDE](https://dune.com/queries) to cross-check daily counts against local data.
 
 ```sql
--- Run in: https://dune.com/queries (new query)
--- Table: dex_solana.trades (decoded by Dune Spellbook)
+-- Bonding curve daily trade counts
 SELECT
-    DATE_TRUNC('day', block_time)   AS day,
-    COUNT(DISTINCT token_bought_mint_address) AS tokens_with_trades,
-    COUNT(*)                         AS total_trades,
-    SUM(amount_usd)                  AS volume_usd
+    DATE_TRUNC('day', block_time) AS day,
+    COUNT(*) AS trades
 FROM dex_solana.trades
 WHERE project = 'pumpdotfun'
   AND block_time >= TIMESTAMP '2026-01-01'
   AND block_time <  TIMESTAMP '2026-05-13'
-GROUP BY 1
-ORDER BY 1;
+GROUP BY 1 ORDER BY 1;
 ```
 
-### Graduation (migration) events — Jan 1 to May 12, 2026
-
 ```sql
--- Uses solana.instruction_calls (raw Solana instructions)
--- pump.fun program: 6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
-SELECT
-    DATE_TRUNC('day', block_time)   AS day,
-    COUNT(*)                         AS migrations
-FROM solana.instruction_calls
-WHERE executing_account = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
-  AND data LIKE '0x%'          -- filter for migrate instruction discriminator
-  AND block_time >= TIMESTAMP '2026-01-01'
-  AND block_time <  TIMESTAMP '2026-05-13'
-GROUP BY 1
-ORDER BY 1;
-```
-
-### Token creation volume — Jan 1 to May 12, 2026
-
-```sql
+-- PumpSwap daily trade counts
 SELECT
     DATE_TRUNC('day', block_time) AS day,
-    COUNT(*) AS tokens_created
-FROM solana.instruction_calls
-WHERE executing_account = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'
+    COUNT(*) AS trades
+FROM dex_solana.trades
+WHERE project = 'pump_amm'
   AND block_time >= TIMESTAMP '2026-01-01'
   AND block_time <  TIMESTAMP '2026-05-13'
-  -- "create" instruction discriminator prefix:
-  AND SUBSTR(data, 1, 18) = '0x181ec828051c0777'
-GROUP BY 1
-ORDER BY 1;
+GROUP BY 1 ORDER BY 1;
 ```
 
-> **Note**: Dune Spellbook schemas evolve. If a query returns an error, check the [Dune documentation](https://docs.dune.com) or community forums for updated table names.
+---
+
+## Security
+
+- `.env` and `keys.txt` are in `.gitignore` and **must never be committed**.
+- RPC API keys belong in `.env` only.
