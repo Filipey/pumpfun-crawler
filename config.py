@@ -35,7 +35,7 @@ RPC_TIMEOUT:       int   = 60     # seconds per request
 MAX_RETRIES:       int   = 6
 RETRY_BACKOFF:     float = 1.5    # exponential base (seconds)
 SIGNATURES_LIMIT:  int   = 1000   # max sigs per getSignaturesForAddress call
-TX_BATCH_SIZE:     int   = 100    # signatures per getTransaction batch call
+TX_BATCH_SIZE:     int   = 25     # signatures per getTransaction batch call (Helius free limit)
 WORKERS:           int   = int(os.getenv("WORKERS", "4"))
 
 # ── Storage ───────────────────────────────────────────────────────────────────

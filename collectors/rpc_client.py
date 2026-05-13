@@ -11,6 +11,7 @@ Multi-endpoint Solana JSON-RPC client with:
 """
 
 import logging
+import re
 import threading
 import time
 from typing import Any, Optional
@@ -27,6 +28,11 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _mask(url: str) -> str:
+    """Redact API key values from URLs so they never appear in logs or tracebacks."""
+    return re.sub(r'(?i)(api[-_]?key=)[^&\s]+', r'\1***', url)
 
 
 class SolanaRPC:
@@ -79,6 +85,7 @@ class SolanaRPC:
         ep = endpoint or self._next()
 
         for attempt in range(MAX_RETRIES + 1):
+            safe_ep = _mask(ep)
 
             # ── Network-level errors ──────────────────────────────────────────
             try:
@@ -87,7 +94,7 @@ class SolanaRPC:
                     requests.exceptions.Timeout) as exc:
                 wait = RETRY_BACKOFF ** attempt
                 logger.warning(
-                    f"Network error from {ep[:50]} "
+                    f"Network error from {safe_ep} "
                     f"({type(exc).__name__}), retry {attempt + 1} in {wait:.1f}s"
                 )
                 time.sleep(wait)
@@ -97,9 +104,7 @@ class SolanaRPC:
             # ── Rate limited ──────────────────────────────────────────────────
             if resp.status_code == 429:
                 wait = RETRY_BACKOFF ** attempt * 4
-                logger.warning(
-                    f"429 from {ep[:50]} — cooling {wait:.1f}s then rotating"
-                )
+                logger.warning(f"429 from {safe_ep} — cooling {wait:.1f}s then rotating")
                 self._mark_cooldown(ep, wait)
                 ep = self._next()
                 continue
@@ -108,7 +113,7 @@ class SolanaRPC:
             if resp.status_code >= 500:
                 wait = RETRY_BACKOFF ** attempt
                 logger.warning(
-                    f"HTTP {resp.status_code} from {ep[:50]}, "
+                    f"HTTP {resp.status_code} from {safe_ep}, "
                     f"retry {attempt + 1} in {wait:.1f}s"
                 )
                 time.sleep(wait)
@@ -117,13 +122,16 @@ class SolanaRPC:
 
             # ── Permanent client error (4xx, not 429) ─────────────────────────
             if not resp.ok:
-                resp.raise_for_status()
+                # Raise with a sanitized message so API keys never appear in logs
+                raise requests.exceptions.HTTPError(
+                    f"HTTP {resp.status_code} {resp.reason} from {safe_ep}",
+                    response=resp,
+                )
 
             return resp.json()
 
         raise RuntimeError(
-            f"Gave up after {MAX_RETRIES + 1} attempts "
-            f"(last endpoint: {ep[:50]})"
+            f"Gave up after {MAX_RETRIES + 1} attempts (last endpoint: {safe_ep})"
         )
 
     # ── Public API ────────────────────────────────────────────────────────────

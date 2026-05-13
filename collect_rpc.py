@@ -81,7 +81,7 @@ logger = logging.getLogger("collect_rpc")
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _date_of(unix_ts: int) -> str:
-    return datetime.datetime.utcfromtimestamp(unix_ts).strftime("%Y-%m-%d")
+    return datetime.datetime.fromtimestamp(unix_ts, datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
 def _dates_in_range(start: str, end: str) -> list[str]:
