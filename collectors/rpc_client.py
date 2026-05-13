@@ -4,8 +4,9 @@ collectors/rpc_client.py
 Multi-endpoint Solana JSON-RPC client with:
   - Round-robin endpoint rotation
   - Per-endpoint 429 cooldown tracking (rate-limited endpoints are skipped
-    until their backoff window expires)
-  - Exponential backoff on errors
+    until their backoff window expires; if all endpoints are cooling down,
+    the client sleeps until the soonest one recovers)
+  - Exponential backoff on network errors and 5xx responses
   - Batch requests for getTransaction (up to TX_BATCH_SIZE per HTTP call)
 """
 
@@ -17,10 +18,10 @@ from typing import Any, Optional
 import requests
 
 from config import (
-    RPC_ENDPOINTS,
-    RPC_TIMEOUT,
     MAX_RETRIES,
     RETRY_BACKOFF,
+    RPC_ENDPOINTS,
+    RPC_TIMEOUT,
     SIGNATURES_LIMIT,
     TX_BATCH_SIZE,
 )
@@ -34,11 +35,16 @@ class SolanaRPC:
         if not self._endpoints:
             raise ValueError("No RPC endpoints configured.")
         self._lock = threading.Lock()
-        self._idx = 0
+        self._idx  = 0
+        # unix-monotonic timestamp until which each endpoint is in 429 cooldown
+        self._cooldown_until: dict[str, float] = {}
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
-        # per-endpoint: unix monotonic timestamp until which the endpoint is cooling down
-        self._cooldown_until: dict[str, float] = {}
+
+        n = len(self._endpoints)
+        logger.info(f"RPC client ready — {n} endpoint(s) configured")
+
+    # ── Endpoint selection ────────────────────────────────────────────────────
 
     def _mark_cooldown(self, ep: str, seconds: float) -> None:
         with self._lock:
@@ -46,8 +52,8 @@ class SolanaRPC:
 
     def _next(self) -> str:
         """
-        Return the next available endpoint, skipping any that are in 429 cooldown.
-        If every endpoint is cooling down, block until the soonest one recovers.
+        Return the next endpoint that is not in 429 cooldown.
+        If every endpoint is cooling down, sleep until the soonest one recovers.
         """
         with self._lock:
             n   = len(self._endpoints)
@@ -59,56 +65,67 @@ class SolanaRPC:
                 if self._cooldown_until.get(ep, 0) <= now:
                     return ep
 
-            # All endpoints are rate-limited — wait for the earliest recovery
+            # All endpoints are cooling — find the one that recovers soonest
             ep   = min(self._endpoints, key=lambda e: self._cooldown_until.get(e, 0))
             wait = max(0.0, self._cooldown_until[ep] - now)
 
-        if wait > 0:
-            logger.warning(f"All endpoints rate-limited — waiting {wait:.1f}s for {ep[:40]}…")
-            time.sleep(wait)
+        # Sleep outside the lock so other threads can proceed
+        logger.warning(f"All endpoints rate-limited — waiting {wait:.1f}s")
+        time.sleep(wait)
         return ep
+
+    # ── HTTP ──────────────────────────────────────────────────────────────────
 
     def _post(self, payload: Any, endpoint: str | None = None) -> Any:
         ep = endpoint or self._next()
-        last_exc: Exception | None = None
 
         for attempt in range(MAX_RETRIES + 1):
+
+            # ── Network-level errors ──────────────────────────────────────────
             try:
                 resp = self._session.post(ep, json=payload, timeout=RPC_TIMEOUT)
-                resp.raise_for_status()
-                return resp.json()
-
-            except requests.exceptions.HTTPError as exc:
-                last_exc = exc
-                status   = exc.response.status_code if exc.response else 0
-
-                if status == 429:
-                    wait = RETRY_BACKOFF ** attempt * 4
-                    logger.warning(f"429 from {ep[:40]}… — cooling {wait:.1f}s, rotating")
-                    self._mark_cooldown(ep, wait)
-                    ep = self._next()
-                    continue
-
-                if status >= 500:
-                    wait = RETRY_BACKOFF ** attempt
-                    logger.warning(f"HTTP {status} from {ep[:40]}…, retry {attempt+1} in {wait:.1f}s")
-                    time.sleep(wait)
-                    ep = self._next()
-                    continue
-
-                raise   # 4xx that is not 429 → permanent failure, don't retry
-
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as exc:
-                last_exc = exc
-                wait     = RETRY_BACKOFF ** attempt
-                logger.warning(f"Network error ({type(exc).__name__}), retry {attempt+1} in {wait:.1f}s")
+                wait = RETRY_BACKOFF ** attempt
+                logger.warning(
+                    f"Network error from {ep[:50]} "
+                    f"({type(exc).__name__}), retry {attempt + 1} in {wait:.1f}s"
+                )
                 time.sleep(wait)
                 ep = self._next()
+                continue
+
+            # ── Rate limited ──────────────────────────────────────────────────
+            if resp.status_code == 429:
+                wait = RETRY_BACKOFF ** attempt * 4
+                logger.warning(
+                    f"429 from {ep[:50]} — cooling {wait:.1f}s then rotating"
+                )
+                self._mark_cooldown(ep, wait)
+                ep = self._next()
+                continue
+
+            # ── Server error ──────────────────────────────────────────────────
+            if resp.status_code >= 500:
+                wait = RETRY_BACKOFF ** attempt
+                logger.warning(
+                    f"HTTP {resp.status_code} from {ep[:50]}, "
+                    f"retry {attempt + 1} in {wait:.1f}s"
+                )
+                time.sleep(wait)
+                ep = self._next()
+                continue
+
+            # ── Permanent client error (4xx, not 429) ─────────────────────────
+            if not resp.ok:
+                resp.raise_for_status()
+
+            return resp.json()
 
         raise RuntimeError(
-            f"All {MAX_RETRIES} retries exhausted (last error: {last_exc})"
-        ) from last_exc
+            f"Gave up after {MAX_RETRIES + 1} attempts "
+            f"(last endpoint: {ep[:50]})"
+        )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -137,10 +154,8 @@ class SolanaRPC:
         })
 
         if isinstance(result, dict):
-            data = result.get("result") or []
-        else:
-            data = []
-        return data
+            return result.get("result") or []
+        return []
 
     def get_transactions(
         self,
