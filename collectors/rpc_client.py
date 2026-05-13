@@ -2,18 +2,20 @@
 collectors/rpc_client.py
 ------------------------
 Multi-endpoint Solana JSON-RPC client with:
-  - Round-robin endpoint rotation
+  - Primary/fallback endpoint selection (endpoints tried in declaration order)
   - Per-endpoint 429 cooldown tracking (rate-limited endpoints are skipped
     until their backoff window expires; if all endpoints are cooling down,
     the client sleeps until the soonest one recovers)
   - Exponential backoff on network errors and 5xx responses
-  - Batch requests for getTransaction (up to TX_BATCH_SIZE per HTTP call)
+  - Concurrent individual getTransaction requests (TX_BATCH_SIZE workers)
+    NOTE: JSON-RPC batch arrays are NOT used — Helius free tier rejects them
 """
 
 import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 import requests
@@ -43,11 +45,18 @@ class SolanaRPC:
         self._lock = threading.Lock()
         # unix-monotonic timestamp until which each endpoint is in 429 cooldown
         self._cooldown_until: dict[str, float] = {}
-        self._session = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
+        # thread-local sessions so concurrent workers don't share one socket
+        self._local = threading.local()
 
         n = len(self._endpoints)
         logger.info(f"RPC client ready — {n} endpoint(s) configured")
+
+    def _session(self) -> requests.Session:
+        if not getattr(self._local, "session", None):
+            s = requests.Session()
+            s.headers.update({"Content-Type": "application/json"})
+            self._local.session = s
+        return self._local.session
 
     # ── Endpoint selection ────────────────────────────────────────────────────
 
@@ -89,7 +98,7 @@ class SolanaRPC:
 
             # ── Network-level errors ──────────────────────────────────────────
             try:
-                resp = self._session.post(ep, json=payload, timeout=RPC_TIMEOUT)
+                resp = self._session().post(ep, json=payload, timeout=RPC_TIMEOUT)
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as exc:
                 wait = RETRY_BACKOFF ** attempt
@@ -172,70 +181,40 @@ class SolanaRPC:
         """
         Fetch full transaction data for a list of signatures.
 
-        Tries TX_BATCH_SIZE per HTTP request. On 413, splits the batch in half
-        and retries each half recursively, down to individual calls. If a single
-        transaction still 413s, it is returned as None and a warning is logged.
+        Sends TX_BATCH_SIZE concurrent individual getTransaction requests.
+        JSON-RPC batch arrays are intentionally avoided — Helius free tier
+        rejects them with 413/403.
         """
+        if not signatures:
+            return []
+
         results: list[Optional[dict]] = [None] * len(signatures)
-        if signatures:
-            self._fetch_txs(signatures, list(range(len(signatures))), results, commitment)
-        return results
-
-    def _fetch_txs(
-        self,
-        all_sigs: list[str],
-        indices: list[int],
-        results: list[Optional[dict]],
-        commitment: str,
-    ) -> None:
-        """Recursively fetch transactions, halving the batch on 413."""
-        if not indices:
-            return
-
-        batch = [all_sigs[i] for i in indices]
         params = {"encoding": "json", "commitment": commitment, "maxSupportedTransactionVersion": 0}
 
-        if len(batch) == 1:
-            # Single request — plain object, not array (maximum compatibility)
+        def _fetch_one(idx: int, sig: str) -> tuple[int, Optional[dict]]:
             try:
                 raw = self._post({
-                    "jsonrpc": "2.0", "id": 0,
+                    "jsonrpc": "2.0", "id": idx,
                     "method": "getTransaction",
-                    "params": [batch[0], params],
+                    "params": [sig, params],
                 })
-                results[indices[0]] = raw.get("result") if isinstance(raw, dict) else None
-            except requests.exceptions.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 413:
-                    logger.warning(f"Skipping oversized transaction {batch[0][:20]}… (413)")
-                else:
-                    raise
-            return
+                return idx, raw.get("result") if isinstance(raw, dict) else None
+            except Exception as exc:
+                logger.warning(f"Failed to fetch tx {sig[:20]}…: {exc}")
+                return idx, None
 
-        # Batch request
-        payload = [
-            {"jsonrpc": "2.0", "id": j, "method": "getTransaction",
-             "params": [sig, params]}
-            for j, sig in enumerate(batch)
-        ]
-        try:
-            raw = self._post(payload)
-            if isinstance(raw, list):
-                raw.sort(key=lambda r: r.get("id", 0) if isinstance(r, dict) else 0)
-                for j, r in enumerate(raw):
-                    results[indices[j]] = r.get("result") if isinstance(r, dict) else None
-        except requests.exceptions.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 413:
-                mid = len(indices) // 2
-                logger.warning(
-                    f"413 on batch of {len(indices)}, splitting → {mid} + {len(indices)-mid}"
-                )
-                self._fetch_txs(all_sigs, indices[:mid], results, commitment)
-                self._fetch_txs(all_sigs, indices[mid:], results, commitment)
-            else:
-                raise
+        with ThreadPoolExecutor(max_workers=TX_BATCH_SIZE) as pool:
+            futures = {pool.submit(_fetch_one, i, sig): i for i, sig in enumerate(signatures)}
+            for fut in as_completed(futures):
+                idx, tx = fut.result()
+                results[idx] = tx
+
+        return results
 
     def close(self) -> None:
-        self._session.close()
+        s = getattr(self._local, "session", None)
+        if s:
+            s.close()
 
     def __enter__(self):
         return self
