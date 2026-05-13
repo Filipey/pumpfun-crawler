@@ -72,6 +72,9 @@ def _setup_logging() -> None:
     root.addHandler(console)
     root.addHandler(file_handler)
 
+    # urllib3 debug lines print the full URL including API keys — keep it quiet
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     logging.getLogger("collect_rpc").info(f"Log file: {log_path}")
 
 

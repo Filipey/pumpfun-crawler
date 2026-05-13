@@ -12,6 +12,7 @@ Multi-endpoint Solana JSON-RPC client with:
 """
 
 import logging
+import random
 import re
 import threading
 import time
@@ -192,6 +193,10 @@ class SolanaRPC:
         params = {"encoding": "json", "commitment": commitment, "maxSupportedTransactionVersion": 0}
 
         def _fetch_one(idx: int, sig: str) -> tuple[int, Optional[dict]]:
+            # Stagger workers so they don't all hit the endpoint simultaneously.
+            # Each worker waits a small random fraction of a second before its
+            # first request, spreading the burst across ~0–0.5s.
+            time.sleep(random.uniform(0, 0.5))
             try:
                 raw = self._post({
                     "jsonrpc": "2.0", "id": idx,
