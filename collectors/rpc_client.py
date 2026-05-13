@@ -171,41 +171,68 @@ class SolanaRPC:
     ) -> list[Optional[dict]]:
         """
         Fetch full transaction data for a list of signatures.
-        Uses JSON-RPC batching (TX_BATCH_SIZE per HTTP request).
-        Returns a list in the same order as `signatures`.
+
+        Tries TX_BATCH_SIZE per HTTP request. On 413, splits the batch in half
+        and retries each half recursively, down to individual calls. If a single
+        transaction still 413s, it is returned as None and a warning is logged.
         """
-        results: list[Optional[dict]] = []
+        results: list[Optional[dict]] = [None] * len(signatures)
+        if signatures:
+            self._fetch_txs(signatures, list(range(len(signatures))), results, commitment)
+        return results
 
-        for batch_start in range(0, len(signatures), TX_BATCH_SIZE):
-            batch   = signatures[batch_start: batch_start + TX_BATCH_SIZE]
-            payload = [
-                {
-                    "jsonrpc": "2.0",
-                    "id": i,
+    def _fetch_txs(
+        self,
+        all_sigs: list[str],
+        indices: list[int],
+        results: list[Optional[dict]],
+        commitment: str,
+    ) -> None:
+        """Recursively fetch transactions, halving the batch on 413."""
+        if not indices:
+            return
+
+        batch = [all_sigs[i] for i in indices]
+        params = {"encoding": "json", "commitment": commitment, "maxSupportedTransactionVersion": 0}
+
+        if len(batch) == 1:
+            # Single request — plain object, not array (maximum compatibility)
+            try:
+                raw = self._post({
+                    "jsonrpc": "2.0", "id": 0,
                     "method": "getTransaction",
-                    "params": [
-                        sig,
-                        {
-                            "encoding": "json",
-                            "commitment": commitment,
-                            "maxSupportedTransactionVersion": 0,
-                        },
-                    ],
-                }
-                for i, sig in enumerate(batch)
-            ]
-            raw = self._post(payload)
+                    "params": [batch[0], params],
+                })
+                results[indices[0]] = raw.get("result") if isinstance(raw, dict) else None
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 413:
+                    logger.warning(f"Skipping oversized transaction {batch[0][:20]}… (413)")
+                else:
+                    raise
+            return
 
+        # Batch request
+        payload = [
+            {"jsonrpc": "2.0", "id": j, "method": "getTransaction",
+             "params": [sig, params]}
+            for j, sig in enumerate(batch)
+        ]
+        try:
+            raw = self._post(payload)
             if isinstance(raw, list):
                 raw.sort(key=lambda r: r.get("id", 0) if isinstance(r, dict) else 0)
-                results.extend(
-                    r.get("result") if isinstance(r, dict) else None
-                    for r in raw
+                for j, r in enumerate(raw):
+                    results[indices[j]] = r.get("result") if isinstance(r, dict) else None
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 413:
+                mid = len(indices) // 2
+                logger.warning(
+                    f"413 on batch of {len(indices)}, splitting → {mid} + {len(indices)-mid}"
                 )
+                self._fetch_txs(all_sigs, indices[:mid], results, commitment)
+                self._fetch_txs(all_sigs, indices[mid:], results, commitment)
             else:
-                results.extend([None] * len(batch))
-
-        return results
+                raise
 
     def close(self) -> None:
         self._session.close()
