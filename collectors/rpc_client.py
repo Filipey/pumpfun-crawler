@@ -3,7 +3,9 @@ collectors/rpc_client.py
 ------------------------
 Multi-endpoint Solana JSON-RPC client with:
   - Round-robin endpoint rotation
-  - Exponential backoff on errors and 429s
+  - Per-endpoint 429 cooldown tracking (rate-limited endpoints are skipped
+    until their backoff window expires)
+  - Exponential backoff on errors
   - Batch requests for getTransaction (up to TX_BATCH_SIZE per HTTP call)
 """
 
@@ -35,43 +37,78 @@ class SolanaRPC:
         self._idx = 0
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+        # per-endpoint: unix monotonic timestamp until which the endpoint is cooling down
+        self._cooldown_until: dict[str, float] = {}
+
+    def _mark_cooldown(self, ep: str, seconds: float) -> None:
+        with self._lock:
+            self._cooldown_until[ep] = time.monotonic() + seconds
 
     def _next(self) -> str:
+        """
+        Return the next available endpoint, skipping any that are in 429 cooldown.
+        If every endpoint is cooling down, block until the soonest one recovers.
+        """
         with self._lock:
-            ep = self._endpoints[self._idx % len(self._endpoints)]
-            self._idx += 1
-            return ep
+            n   = len(self._endpoints)
+            now = time.monotonic()
+
+            for i in range(n):
+                ep = self._endpoints[self._idx % n]
+                self._idx += 1
+                if self._cooldown_until.get(ep, 0) <= now:
+                    return ep
+
+            # All endpoints are rate-limited — wait for the earliest recovery
+            ep   = min(self._endpoints, key=lambda e: self._cooldown_until.get(e, 0))
+            wait = max(0.0, self._cooldown_until[ep] - now)
+
+        if wait > 0:
+            logger.warning(f"All endpoints rate-limited — waiting {wait:.1f}s for {ep[:40]}…")
+            time.sleep(wait)
+        return ep
 
     def _post(self, payload: Any, endpoint: str | None = None) -> Any:
         ep = endpoint or self._next()
+        last_exc: Exception | None = None
+
         for attempt in range(MAX_RETRIES + 1):
             try:
                 resp = self._session.post(ep, json=payload, timeout=RPC_TIMEOUT)
                 resp.raise_for_status()
                 return resp.json()
+
             except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response else 0
+                last_exc = exc
+                status   = exc.response.status_code if exc.response else 0
+
                 if status == 429:
                     wait = RETRY_BACKOFF ** attempt * 4
-                    logger.warning(f"429 from {ep}, sleeping {wait:.1f}s then rotating")
-                    time.sleep(wait)
+                    logger.warning(f"429 from {ep[:40]}… — cooling {wait:.1f}s, rotating")
+                    self._mark_cooldown(ep, wait)
                     ep = self._next()
                     continue
+
                 if status >= 500:
                     wait = RETRY_BACKOFF ** attempt
-                    logger.warning(f"{status} from {ep}, retry {attempt+1} in {wait:.1f}s")
+                    logger.warning(f"HTTP {status} from {ep[:40]}…, retry {attempt+1} in {wait:.1f}s")
                     time.sleep(wait)
                     ep = self._next()
                     continue
-                raise
+
+                raise   # 4xx that is not 429 → permanent failure, don't retry
+
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as exc:
-                wait = RETRY_BACKOFF ** attempt
-                logger.warning(f"Network error ({exc}), retry {attempt+1} in {wait:.1f}s")
+                last_exc = exc
+                wait     = RETRY_BACKOFF ** attempt
+                logger.warning(f"Network error ({type(exc).__name__}), retry {attempt+1} in {wait:.1f}s")
                 time.sleep(wait)
                 ep = self._next()
 
-        raise RuntimeError(f"All {MAX_RETRIES} retries exhausted")
+        raise RuntimeError(
+            f"All {MAX_RETRIES} retries exhausted (last error: {last_exc})"
+        ) from last_exc
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -85,9 +122,7 @@ class SolanaRPC:
     ) -> list[dict]:
         """
         Paginate transaction signatures for a program address.
-
-        Returns list of {signature, slot, blockTime, err, memo}.
-        Sorted newest → oldest.
+        Returns list of {signature, slot, blockTime, err, memo}, newest → oldest.
         """
         config: dict = {"limit": limit, "commitment": commitment}
         if before:
@@ -114,16 +149,13 @@ class SolanaRPC:
     ) -> list[Optional[dict]]:
         """
         Fetch full transaction data for a list of signatures.
-
-        Uses JSON-RPC batching (TX_BATCH_SIZE per HTTP request) to minimise
-        the number of round trips.
-
+        Uses JSON-RPC batching (TX_BATCH_SIZE per HTTP request).
         Returns a list in the same order as `signatures`.
         """
         results: list[Optional[dict]] = []
 
         for batch_start in range(0, len(signatures), TX_BATCH_SIZE):
-            batch = signatures[batch_start: batch_start + TX_BATCH_SIZE]
+            batch   = signatures[batch_start: batch_start + TX_BATCH_SIZE]
             payload = [
                 {
                     "jsonrpc": "2.0",
@@ -142,7 +174,6 @@ class SolanaRPC:
             ]
             raw = self._post(payload)
 
-            # raw is a list of RPC response objects; sort by id to preserve order
             if isinstance(raw, list):
                 raw.sort(key=lambda r: r.get("id", 0) if isinstance(r, dict) else 0)
                 results.extend(
