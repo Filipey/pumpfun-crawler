@@ -114,46 +114,71 @@ def _b58encode(data: bytes) -> str:
 # ── Event decoders ────────────────────────────────────────────────────────────
 
 def _decode_trade(r: _Reader) -> dict:
+    # Field order verified against pump-fun/pump-public-docs idl/pump.json history
+    # (stable prefix from commit 33590255fe, 2025-10-17, onward — later revisions
+    # only append fields after creator_fee, e.g. track_volume, total_unclaimed_
+    # tokens, ix_name, mayhem_mode, cashback/buyback fields — safe to ignore).
+    # The `creator` field lets us fill coin_creator directly on every trade
+    # instead of relying solely on a later join against the CreateEvent.
     mint                 = r.pubkey()
     sol_amount           = r.u64()
     token_amount         = r.u64()
     is_buy               = r.bool_()
     user                 = r.pubkey()
     timestamp            = r.i64()
-    v_sol                = r.u64()
-    v_tok                = r.u64()
-    # Some program versions include real reserves — read if bytes remain
+    v_sol                = r.u64()   # virtual_sol_reserves
+    v_tok                = r.u64()   # virtual_token_reserves
+    _real_sol_reserves   = r.u64()
+    _real_token_reserves = r.u64()
+    _fee_recipient       = r.pubkey()
+    _fee_basis_points    = r.u64()
+    fee                  = r.u64()
+    creator              = r.pubkey()
+    _creator_fee_bps     = r.u64()
+    creator_fee          = r.u64()
     return {
         "tx_type":                  "buy" if is_buy else "sell",
         "is_buy":                   is_buy,
         "mint":                     mint,
         "trader":                   user,
-        "coin_creator":             None,   # enriched later via CreateEvent join
+        "coin_creator":             creator,
         "bonding_curve":            None,
         "sol_amount":               sol_amount,
         "token_amount":             token_amount,
         "in_bonding_curve":         True,
         "v_sol_in_bonding_curve":   v_sol,
         "v_tok_in_bonding_curve":   v_tok,
+        "protocol_fee":             fee,
+        "coin_creator_fee":         creator_fee,
     }
 
 
 def _decode_create(r: _Reader) -> dict:
+    # Field order verified against pump-fun/pump-public-docs idl/pump.json history
+    # (stable from commit 33590255fe, 2025-10-17, through at least 2026-05-18 —
+    # every later revision only appends fields after virtual_sol_reserves, e.g.
+    # real_token_reserves, token_total_supply, token_program, is_mayhem_mode,
+    # is_cashback_enabled, quote_mint, virtual_quote_reserves — safe to ignore
+    # since Borsh reads don't require consuming the full buffer).
+    # A prior version of this decoder read `timestamp` immediately after `user`,
+    # which silently misaligned every field that followed once the program added
+    # a distinct `creator` field between `user` and `timestamp`.
     name          = r.string()
     symbol        = r.string()
     uri           = r.string()
     mint          = r.pubkey()
     bonding_curve = r.pubkey()
-    user          = r.pubkey()   # creator
+    user          = r.pubkey()   # wallet that submitted the create tx
+    creator       = r.pubkey()   # wallet entitled to creator fee revenue (usually == user)
     timestamp     = r.i64()      # we'll overwrite with blockTime for consistency
-    v_sol         = r.u64()
-    v_tok         = r.u64()
+    v_tok         = r.u64()      # virtual_token_reserves
+    v_sol         = r.u64()      # virtual_sol_reserves
     return {
         "tx_type":                  "create",
         "is_buy":                   None,
         "mint":                     mint,
         "trader":                   user,
-        "coin_creator":             user,   # same wallet creates and is the creator
+        "coin_creator":             creator,
         "bonding_curve":            bonding_curve,
         "sol_amount":               0,
         "token_amount":             0,
@@ -275,17 +300,17 @@ def decode_transaction(tx: dict, signature: str) -> list[dict]:
 # Program: pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA
 # Terminology: base = token (memecoin), quote = SOL (WSOL)
 #
-# Field layout matches the PumpSwap Anchor IDL (published March 2025).
-# VALIDATE against a real transaction if you suspect a field mismatch:
-#   python - <<'EOF'
-#   import base64, requests
-#   tx = requests.post(RPC_URL, json={"jsonrpc":"2.0","id":1,
-#       "method":"getTransaction","params":[KNOWN_SIG,
-#       {"encoding":"json","maxSupportedTransactionVersion":0}]}).json()
-#   for m in tx["result"]["meta"]["logMessages"]:
-#       if m.startswith("Program data: "):
-#           print(base64.b64decode(m[14:]).hex())
-#   EOF
+# Field layout verified against pump-fun/pump-public-docs idl/pump_amm.json
+# history (stable prefix from commit 33590255fe, 2025-10-17, through at least
+# commit 3c6721a67c, 2026-05-18 — every revision in that range only appends
+# fields after coin_creator_fee, e.g. track_volume, ix_name, cashback/buyback
+# fields — safe to ignore since Borsh reads don't require consuming the full
+# buffer). A prior version of this decoder had both the wrong field count and
+# wrong field order (confirmed by decoding a real Dec 2025 mainnet transaction:
+# the discriminator matched but parsing overran the buffer) — re-verify against
+# a real transaction (see collectors/decoder.py git history for the probe
+# script) if a BufferError ever reappears here, since the program can still
+# change its event layout going forward.
 
 PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 
@@ -295,30 +320,29 @@ PS_CREATE_POOL_DISC = _event_disc("CreatePoolEvent")
 
 
 def _decode_ps_buy(r: _Reader) -> dict:
-    timestamp            = r.i64()
-    base_amount_out      = r.u64()   # tokens received by user
-    _max_quote_in        = r.u64()   # max SOL willing to pay (slippage limit)
-    _user_base_reserves  = r.u64()
-    _user_quote_reserves = r.u64()
-    pool_base_reserves   = r.u64()   # token reserves in pool after trade
-    pool_quote_reserves  = r.u64()   # SOL reserves in pool after trade
-    quote_amount_in      = r.u64()   # actual SOL paid (incl. fees)
-    _lp_fee_bps          = r.u64()
-    _protocol_fee_bps    = r.u64()
-    _quote_input         = r.u64()
-    lp_fee               = r.u64()
-    protocol_fee         = r.u64()
-    user                 = r.pubkey()
-    pool                 = r.pubkey()
-    _user_base_ta        = r.pubkey()
-    _user_quote_ta       = r.pubkey()
-    _pool_base_ta        = r.pubkey()
-    _pool_quote_ta       = r.pubkey()
-    _prot_fee_recip      = r.pubkey()
-    _prot_fee_recip_ta   = r.pubkey()
-    coin_creator         = r.pubkey()
-    _creator_fee_ta      = r.pubkey()
-    coin_creator_fee     = r.u64()
+    timestamp                  = r.i64()
+    base_amount_out            = r.u64()   # tokens received by user
+    _max_quote_amount_in       = r.u64()   # max SOL willing to pay (slippage limit)
+    _user_base_token_reserves  = r.u64()
+    _user_quote_token_reserves = r.u64()
+    pool_base_reserves         = r.u64()   # token reserves in pool after trade
+    pool_quote_reserves        = r.u64()   # SOL reserves in pool after trade
+    quote_amount_in            = r.u64()   # actual SOL paid (incl. fees)
+    _lp_fee_bps                = r.u64()
+    lp_fee                     = r.u64()
+    _protocol_fee_bps          = r.u64()
+    protocol_fee               = r.u64()
+    _quote_amount_in_w_lp_fee  = r.u64()
+    _user_quote_amount_in      = r.u64()
+    pool                       = r.pubkey()
+    user                       = r.pubkey()
+    _user_base_ta              = r.pubkey()
+    _user_quote_ta             = r.pubkey()
+    _prot_fee_recip            = r.pubkey()
+    _prot_fee_recip_ta         = r.pubkey()
+    coin_creator                = r.pubkey()
+    _coin_creator_fee_bps       = r.u64()
+    coin_creator_fee            = r.u64()
     return {
         "tx_type":               "buy",
         "is_buy":                True,
@@ -340,30 +364,29 @@ def _decode_ps_buy(r: _Reader) -> dict:
 
 
 def _decode_ps_sell(r: _Reader) -> dict:
-    timestamp            = r.i64()
-    base_amount_in       = r.u64()   # tokens sold by user
-    _min_quote_out       = r.u64()   # min SOL willing to accept (slippage limit)
-    _user_base_reserves  = r.u64()
-    _user_quote_reserves = r.u64()
-    pool_base_reserves   = r.u64()
-    pool_quote_reserves  = r.u64()
-    quote_amount_out     = r.u64()   # actual SOL received
-    _lp_fee_bps          = r.u64()
-    _protocol_fee_bps    = r.u64()
-    _quote_output        = r.u64()
-    lp_fee               = r.u64()
-    protocol_fee         = r.u64()
-    user                 = r.pubkey()
-    pool                 = r.pubkey()
-    _user_base_ta        = r.pubkey()
-    _user_quote_ta       = r.pubkey()
-    _pool_base_ta        = r.pubkey()
-    _pool_quote_ta       = r.pubkey()
-    _prot_fee_recip      = r.pubkey()
-    _prot_fee_recip_ta   = r.pubkey()
-    coin_creator         = r.pubkey()
-    _creator_fee_ta      = r.pubkey()
-    coin_creator_fee     = r.u64()
+    timestamp                  = r.i64()
+    base_amount_in             = r.u64()   # tokens sold by user
+    _min_quote_amount_out      = r.u64()   # min SOL willing to accept (slippage limit)
+    _user_base_token_reserves  = r.u64()
+    _user_quote_token_reserves = r.u64()
+    pool_base_reserves         = r.u64()
+    pool_quote_reserves        = r.u64()
+    quote_amount_out           = r.u64()   # actual SOL received
+    _lp_fee_bps                = r.u64()
+    lp_fee                     = r.u64()
+    _protocol_fee_bps          = r.u64()
+    protocol_fee               = r.u64()
+    _quote_amount_out_wo_lp    = r.u64()
+    _user_quote_amount_out     = r.u64()
+    pool                       = r.pubkey()
+    user                       = r.pubkey()
+    _user_base_ta              = r.pubkey()
+    _user_quote_ta             = r.pubkey()
+    _prot_fee_recip            = r.pubkey()
+    _prot_fee_recip_ta         = r.pubkey()
+    coin_creator                = r.pubkey()
+    _coin_creator_fee_bps       = r.u64()
+    coin_creator_fee            = r.u64()
     return {
         "tx_type":               "sell",
         "is_buy":                False,
@@ -385,6 +408,15 @@ def _decode_ps_sell(r: _Reader) -> dict:
 
 
 def _decode_ps_create_pool(r: _Reader) -> dict:
+    # `creator` (field 3) is the wallet/PDA that submitted the pool-creation tx
+    # (graduation is protocol-triggered, so this is typically pump.fun's own
+    # authority, not the token's creator). `coin_creator` (field 20) is the
+    # token's actual creator, entitled to post-graduation fee revenue — these
+    # were previously conflated by reusing one misaligned `creator` variable
+    # for both, which also silently shifted every field read after
+    # pool_quote_amount since three u64 fields and a u8 (minimum_liquidity,
+    # initial_liquidity, lp_token_amount_out, pool_bump) sit between it and
+    # `pool` in the actual IDL.
     timestamp            = r.i64()
     _index               = r.u16()   # pool index (auto-incrementing)
     creator              = r.pubkey()
@@ -396,20 +428,22 @@ def _decode_ps_create_pool(r: _Reader) -> dict:
     quote_amount_in      = r.u64()   # SOL seeded into pool
     pool_base_reserves   = r.u64()
     pool_quote_reserves  = r.u64()
+    _minimum_liquidity   = r.u64()
+    _initial_liquidity   = r.u64()
+    _lp_token_amount_out = r.u64()
+    _pool_bump           = r.u8()
     pool                 = r.pubkey()
     _lp_mint             = r.pubkey()
-    _user_pool_ta        = r.pubkey()
-    _pool_base_ta        = r.pubkey()
-    _pool_quote_ta       = r.pubkey()
     _user_base_ta        = r.pubkey()
     _user_quote_ta       = r.pubkey()
+    coin_creator         = r.pubkey()
     return {
         "tx_type":               "pool_create",
         "is_buy":                None,
         "mint":                  base_mint,
         "pool":                  pool,
         "trader":                creator,
-        "coin_creator":          creator,
+        "coin_creator":          coin_creator,
         "bonding_curve":         None,
         "sol_amount":            quote_amount_in,
         "token_amount":          base_amount_in,
