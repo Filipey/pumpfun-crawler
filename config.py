@@ -55,3 +55,14 @@ SOLARCHIVE_REPO:  str = "solarchive/solarchive"
 SOLARCHIVE_START: str = os.getenv("SOLARCHIVE_START", "2025-11-01")
 SOLARCHIVE_END:   str = os.getenv("SOLARCHIVE_END",   "2025-12-05")   # last day SolArchive has published
 SOLARCHIVE_WORKERS: int = int(os.getenv("SOLARCHIVE_WORKERS", "4"))   # concurrent shard fetches
+
+# ── Phase B: Old Faithful / Jetstreamer ───────────────────────────────────────
+OLDFAITHFUL_START: str = os.getenv("OLDFAITHFUL_START", "2025-12-06")  # day after SolArchive's coverage ends
+OLDFAITHFUL_END:   str = os.getenv("OLDFAITHFUL_END",   "2026-07-04")  # extend + rerun later for the rest of July
+# Path to the compiled pumpfun_filter_plugin binary (must be built first with
+# `cargo build --release` inside pumpfun_filter_plugin/ — see that crate's
+# README/module docstring; not compiled/verified in this environment).
+JETSTREAMER_BIN: Path = Path(
+    os.getenv("JETSTREAMER_BIN", "./pumpfun_filter_plugin/target/release/pumpfun-filter-plugin")
+)
+OLDFAITHFUL_OUT_DIR: Path = DATA_DIR / "oldfaithful_raw"  # transient plugin JSONL output, deleted per epoch after ingest
