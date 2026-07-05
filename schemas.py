@@ -59,6 +59,89 @@ TX_DTYPES: dict = {
 }
 
 
+# ── Per-entity tables (bulk-source redesign) ─────────────────────────────────
+#
+# Replaces the single flat TX_DTYPES table above. Normalized so bonding-curve
+# and PumpSwap-only columns don't sit NULL on every row of the other kind.
+# TX_DTYPES/apply_dtypes are kept as-is for reading any already-collected
+# legacy files from the RPC-based crawler.
+
+TOKEN_DTYPES: dict = {
+    "mint":             "str",    # PK
+    "coin_creator":     "str",    # wallet entitled to creator fee revenue
+    "bonding_curve":    "str",
+    "name":             "str",
+    "symbol":           "str",
+    "uri":              "str",
+    "created_slot":     "Int64",
+    "created_at":       "Int64",  # unix seconds
+    "created_signature":"str",
+}
+
+TOKEN_METADATA_DTYPES: dict = {
+    "mint":             "str",    # FK -> tokens.mint
+    "image_url":        "str",
+    "description":      "str",
+    "twitter":          "str",
+    "telegram":         "str",
+    "website":          "str",
+    "resolved_status":  "str",    # ok | not_found | timeout | invalid_json | pending
+    "resolved_at":      "Int64",
+}
+
+POOL_DTYPES: dict = {
+    "pool":             "str",    # PK
+    "mint":             "str",    # FK -> tokens.mint
+    "creator":          "str",    # coin_creator at time of pool creation
+    "created_slot":     "Int64",
+    "created_at":       "Int64",
+    "created_signature":"str",
+}
+
+GRADUATION_DTYPES: dict = {
+    "mint":             "str",
+    "signature":        "str",
+    "slot":             "Int64",
+    "block_time":       "Int64",
+}
+
+_TRADE_COMMON_DTYPES: dict = {
+    "signature":                "str",
+    "slot":                     "Int64",
+    "block_time":               "Int64",
+    "mint":                     "str",
+    "trader":                   "str",
+    "tx_type":                  "str",    # "buy" | "sell"
+    "is_buy":                   "bool",
+    "v_sol_in_bonding_curve":   "Int64",
+    "v_tok_in_bonding_curve":   "Int64",
+    "sol_amount":               "Int64",
+    "token_amount":             "Int64",
+    "is_bot":                   "bool",
+    "coin_creator":             "str",
+    "coin_creator_fee":         "Int64",
+    "source_phase":             "str",    # which ingestion phase produced this row (solarchive|oldfaithful)
+}
+
+BONDING_CURVE_TRADE_DTYPES: dict = dict(_TRADE_COMMON_DTYPES)
+
+PUMPSWAP_TRADE_DTYPES: dict = {
+    **_TRADE_COMMON_DTYPES,
+    "pool":         "str",
+    "lp_fee":       "Int64",
+    "protocol_fee": "Int64",
+}
+
+# table name -> (dtype dict, dedup key columns)
+ENTITY_TABLES: dict = {
+    "tokens":               (TOKEN_DTYPES, ["mint"]),
+    "pools":                (POOL_DTYPES, ["pool"]),
+    "graduations":          (GRADUATION_DTYPES, ["signature"]),
+    "bonding_curve_trades": (BONDING_CURVE_TRADE_DTYPES, ["signature", "tx_type"]),
+    "pumpswap_trades":      (PUMPSWAP_TRADE_DTYPES, ["signature", "tx_type"]),
+}
+
+
 def apply_dtypes(df: pd.DataFrame, dtype_map: dict) -> pd.DataFrame:
     """Cast DataFrame columns to the specified dtypes; silently skip missing cols."""
     for col, dtype in dtype_map.items():

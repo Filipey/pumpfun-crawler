@@ -42,9 +42,16 @@ WORKERS:           int   = int(os.getenv("WORKERS", "4"))
 DATA_DIR:    Path = Path(os.getenv("DATA_DIR", "./data"))
 RAW_DIR:     Path = DATA_DIR / "raw"
 PARQUET_DIR: Path = DATA_DIR / "parquet"
+WAREHOUSE_DB_PATH: Path = DATA_DIR / "warehouse.duckdb"
 
 for _d in [RAW_DIR, PARQUET_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
 CHECKPOINT_PATH: Path = DATA_DIR / "checkpoint.json"
+
+# ── Bulk-source backfill window (Phase A/B redesign) ──────────────────────────
+SOLARCHIVE_REPO:  str = "solarchive/solarchive"
+SOLARCHIVE_START: str = os.getenv("SOLARCHIVE_START", "2025-11-01")
+SOLARCHIVE_END:   str = os.getenv("SOLARCHIVE_END",   "2025-12-05")   # last day SolArchive has published
+SOLARCHIVE_WORKERS: int = int(os.getenv("SOLARCHIVE_WORKERS", "4"))   # concurrent shard fetches
