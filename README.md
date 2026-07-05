@@ -66,16 +66,21 @@ care which phase produced a given day.
 
 ```
 collect_solarchive.py        Phase A CLI (SolArchive backfill)
+collect_oldfaithful.py        Phase B CLI (Old Faithful/Jetstreamer backfill)
 collect_rpc.py                Legacy/fallback: raw-RPC crawler (kept, not primary)
 config.py                     Constants and env-var overrides
 schemas.py                    Per-entity dtype definitions + dtype casts
 collectors/
   solarchive_source.py        Phase A ingestion adapter (DuckDB httpfs + decode)
+  oldfaithful_source.py        Phase B ingestion adapter (reads plugin JSONL + decode)
+  epoch_utils.py                Calendar date <-> Solana epoch estimation for Phase B
   decoder.py                  Anchor event decoders for both programs (Borsh + base58)
   day_store.py                EntityStore: batched Parquet writer + compaction
   checkpoint.py                Per-source, per-chunk resume state
   warehouse.py                 DuckDB view/materialization layer over Parquet
   rpc_client.py                Solana JSON-RPC client (kept for legacy path / spot checks)
+pumpfun_filter_plugin/        Rust Jetstreamer plugin for Phase B (see its own README —
+                               UNCOMPILED/UNVERIFIED, needs a Rust+Clang16+RocksDB toolchain)
 data/
   parquet/
     tokens/tokens_2025-11-01.parquet
@@ -125,6 +130,36 @@ python collect_solarchive.py
 
 Safe to interrupt (Ctrl-C) and rerun — checkpointed per day in
 `data/checkpoint.json` under the `"solarchive"` source key.
+
+---
+
+## Quick start (Phase B — Old Faithful/Jetstreamer, 2025-12-06 onward)
+
+Covers the part of the window SolArchive doesn't reach. **Requires building
+the Rust plugin first** — see `pumpfun_filter_plugin/README.md`. This plugin
+was written without a Rust toolchain available and has not been compiled or
+run against real data; treat the first build/run on the lab server as part
+of bringing this phase up, not as a known-working path yet.
+
+```bash
+# 1. Build the plugin (needs Clang 16 + RocksDB build deps — see
+#    pumpfun_filter_plugin/README.md and jetstreamer's own README)
+cd pumpfun_filter_plugin && cargo build --release && cd ..
+
+# 2. Smoke-test: a single epoch (~2 days of chain history)
+python collect_oldfaithful.py --epoch 990
+
+# 3. Full backfill (2025-12-06 .. today, resumable per-epoch)
+python collect_oldfaithful.py
+```
+
+Epoch boundaries for a date range are estimated via `collectors/epoch_utils.py`
+(calibrated against a live public RPC's current slot/blocktime, padded by a
+few epochs on each side — precision doesn't matter much since every
+transaction is bucketed into its correct calendar day using its own
+`block_time`, not the epoch it happened to come from). Safe to interrupt and
+rerun — checkpointed per epoch under the `"oldfaithful"` source key, same
+`data/checkpoint.json`.
 
 ---
 
