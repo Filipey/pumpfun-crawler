@@ -26,6 +26,10 @@ env/
 .env/
 ENV/
 
+# ── Rust build artifacts (pumpfun_filter_plugin) ──────────────────────────────
+target/
+Cargo.lock
+
 # ── IDEs ──────────────────────────────────────────────────────────────────────
 .idea/
 .vscode/
