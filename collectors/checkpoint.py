@@ -1,25 +1,36 @@
 """
 collectors/checkpoint.py
 ------------------------
-Thread-safe, day-level checkpoint backed by a JSON file.
+Thread-safe checkpoint backed by a JSON file, generalized across ingestion
+sources (solarchive, oldfaithful, uri_resolution, ...) and their natural work
+unit ("chunk" — a day string, an epoch id, whatever the source uses).
 
-Tracks which calendar days have been fully collected so that the crawler
-can resume without re-fetching already-processed data.
+Shape:
+    {
+      "sources": {
+        "solarchive": {
+          "2025-11-01": {"status": "done", "rows": 812345, "updated_at": "..."},
+          "2025-11-02": {"status": "partial", ...}
+        },
+        "oldfaithful": { ... }
+      },
+      "spend": {}
+    }
 
-States per day:
-  "done"     → all transactions for this day have been fetched, decoded,
-                and written to Parquet
-  "partial"  → collection started but not yet complete (e.g. process killed)
+States per chunk: "pending" (absent) -> "in_progress" -> "done" | "partial" | "failed_permanent"
 """
 
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 
 from config import CHECKPOINT_PATH
 
 logger = logging.getLogger(__name__)
+
+TERMINAL_STATES = {"done", "failed_permanent"}
 
 
 class Checkpoint:
@@ -33,15 +44,14 @@ class Checkpoint:
             try:
                 with open(self.path, encoding="utf-8") as fh:
                     data = json.load(fh)
-                logger.info(
-                    f"Checkpoint loaded: "
-                    f"{len(data.get('done', []))} done days, "
-                    f"cursor={data.get('cursor')}"
-                )
+                data.setdefault("sources", {})
+                data.setdefault("spend", {})
+                n_sources = len(data["sources"])
+                logger.info(f"Checkpoint loaded: {n_sources} source(s) tracked from {self.path}")
                 return data
             except Exception as exc:
                 logger.warning(f"Could not read checkpoint: {exc}. Starting fresh.")
-        return {"done": [], "partial": [], "cursor": None, "pumpswap_cursor": None}
+        return {"sources": {}, "spend": {}}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,67 +60,64 @@ class Checkpoint:
             json.dump(self._data, fh, indent=2)
         tmp.replace(self.path)
 
-    # ── Day status ────────────────────────────────────────────────────────────
+    # ── Chunk status ──────────────────────────────────────────────────────────
 
-    def is_done(self, date: str) -> bool:
+    def status(self, source: str, chunk: str) -> str:
+        """Return the chunk's status, or "pending" if never touched."""
         with self._lock:
-            return date in self._data["done"]
+            return self._data["sources"].get(source, {}).get(chunk, {}).get("status", "pending")
 
-    def mark_done(self, date: str) -> None:
+    def is_done(self, source: str, chunk: str) -> bool:
+        return self.status(source, chunk) == "done"
+
+    def mark(self, source: str, chunk: str, status: str, **meta) -> None:
         with self._lock:
-            done = self._data.setdefault("done", [])
-            partial = self._data.setdefault("partial", [])
-            if date not in done:
-                done.append(date)
-            if date in partial:
-                partial.remove(date)
+            bucket = self._data["sources"].setdefault(source, {})
+            entry = bucket.setdefault(chunk, {})
+            entry["status"] = status
+            entry["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            entry.update(meta)
             self._save()
 
-    def mark_partial(self, date: str) -> None:
+    def done_chunks(self, source: str) -> list[str]:
         with self._lock:
-            partial = self._data.setdefault("partial", [])
-            if date not in partial:
-                partial.append(date)
+            bucket = self._data["sources"].get(source, {})
+            return sorted(c for c, e in bucket.items() if e.get("status") == "done")
+
+    def pending_chunks(self, source: str, all_chunks: list[str]) -> list[str]:
+        """All_chunks not yet in a terminal state for this source."""
+        with self._lock:
+            bucket = self._data["sources"].get(source, {})
+            return [
+                c for c in all_chunks
+                if bucket.get(c, {}).get("status") not in TERMINAL_STATES
+            ]
+
+    # ── Spend tracking (paid-API budget guard; unused by free sources) ───────
+
+    def add_spend(self, source: str, amount: float) -> float:
+        with self._lock:
+            spend = self._data.setdefault("spend", {})
+            spend[source] = spend.get(source, 0.0) + amount
             self._save()
+            return spend[source]
 
-    # ── Pagination cursor ─────────────────────────────────────────────────────
-
-    @property
-    def cursor(self) -> str | None:
-        """Last pump.fun bonding curve signature processed."""
+    def spend_so_far(self, source: str) -> float:
         with self._lock:
-            return self._data.get("cursor")
-
-    def set_cursor(self, signature: str | None) -> None:
-        with self._lock:
-            self._data["cursor"] = signature
-            self._save()
-
-    @property
-    def pumpswap_cursor(self) -> str | None:
-        """Last PumpSwap AMM signature processed."""
-        with self._lock:
-            return self._data.get("pumpswap_cursor")
-
-    def set_pumpswap_cursor(self, signature: str | None) -> None:
-        with self._lock:
-            self._data["pumpswap_cursor"] = signature
-            self._save()
+            return self._data.get("spend", {}).get(source, 0.0)
 
     # ── Summary ───────────────────────────────────────────────────────────────
 
-    @property
-    def done_days(self) -> list[str]:
+    def summary(self, source: str | None = None) -> str:
         with self._lock:
-            return sorted(self._data.get("done", []))
-
-    def summary(self) -> str:
-        with self._lock:
-            n_done      = len(self._data.get("done", []))
-            n_partial   = len(self._data.get("partial", []))
-            cursor      = self._data.get("cursor", "none")
-            ps_cursor   = self._data.get("pumpswap_cursor", "none")
-        return (
-            f"done={n_done} days, partial={n_partial}, "
-            f"pumpfun_cursor={cursor}, pumpswap_cursor={ps_cursor}"
-        )
+            sources = self._data["sources"]
+            if source:
+                sources = {source: sources.get(source, {})}
+            parts = []
+            for name, bucket in sources.items():
+                counts: dict[str, int] = {}
+                for entry in bucket.values():
+                    st = entry.get("status", "pending")
+                    counts[st] = counts.get(st, 0) + 1
+                parts.append(f"{name}: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+            return " | ".join(parts) if parts else "no sources tracked yet"
