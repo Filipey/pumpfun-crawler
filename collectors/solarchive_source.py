@@ -106,6 +106,45 @@ def _row_to_tx(row) -> tuple[dict, str]:
     return tx, row.signature
 
 
+QUALITY_PROBE_SAMPLE = 50
+QUALITY_PROBE_MIN_RATIO = 0.5
+
+
+def probe_day_log_quality(date: str) -> tuple[bool, float, int]:
+    """
+    Cheap pre-check (touches one shard, not a whole day's ~200-300): what
+    fraction of matched rows in the first shard have real, populated
+    log_messages (more than the single-empty-string placeholder some of
+    SolArchive's Nov 2025 backfill has for whole days — confirmed by
+    inspection: some Nov 2025 days are internally consistent at 0% real
+    log_messages across every shard, even reading a fully-downloaded local
+    copy of the file, ruling out a remote-read issue — this is a genuine gap
+    in that portion of the archive, not a bug in this pipeline).
+
+    Returns (is_usable, ratio, sample_size). A day with no matches at all in
+    the sampled shard is treated as usable-but-inconclusive (ratio=1.0,
+    sample_size=0) rather than bad, since that can happen on a slow shard.
+    """
+    shard_urls = list_day_shards(date)
+    if not shard_urls:
+        return False, 0.0, 0
+
+    con = _connection()
+    query = _FILTERED_QUERY + f"\n    LIMIT {QUALITY_PROBE_SAMPLE}"
+    try:
+        df = con.execute(query, [shard_urls[0], PUMPFUN_PROGRAM, PUMPSWAP_PROGRAM]).fetchdf()
+    except Exception as exc:
+        logger.warning(f"[solarchive] {date}: quality probe failed ({exc}), treating as unusable")
+        return False, 0.0, 0
+
+    if len(df) == 0:
+        return True, 1.0, 0
+
+    real = (df["log_messages"].apply(lambda x: len(x) if x is not None else 0) > 1).sum()
+    ratio = real / len(df)
+    return ratio >= QUALITY_PROBE_MIN_RATIO, ratio, len(df)
+
+
 def process_shard(url: str, date: str, store: EntityStore) -> int:
     """Query one shard, decode matching rows, feed EntityStore. Returns event count."""
     con = _connection()
