@@ -25,7 +25,13 @@ import sys
 from config import DATA_DIR, SOLARCHIVE_END, SOLARCHIVE_START, SOLARCHIVE_WORKERS
 from collectors.checkpoint import Checkpoint
 from collectors.day_store import EntityStore
-from collectors.solarchive_source import FLUSH_EVERY_SHARDS, list_day_shards, process_day
+from collectors.solarchive_source import (
+    FLUSH_EVERY_SHARDS,
+    QUALITY_PROBE_MIN_RATIO,
+    list_day_shards,
+    probe_day_log_quality,
+    process_day,
+)
 
 SOURCE = "solarchive"
 
@@ -108,6 +114,21 @@ def collect(
         for date in todo_days:
             checkpoint.mark(SOURCE, date, "in_progress")
             logger.info(f"=== [{date}] starting ===")
+
+            if not max_shards and not force_accept:
+                usable, ratio, sample_n = probe_day_log_quality(date)
+                if not usable:
+                    checkpoint.mark(SOURCE, date, "partial", quality_probe_ratio=ratio, quality_probe_sample=sample_n)
+                    logger.error(
+                        f"=== [{date}] SKIPPED — quality probe found only {ratio:.0%} of "
+                        f"{sample_n} sampled rows have real log_messages (need >={QUALITY_PROBE_MIN_RATIO:.0%}). "
+                        f"SolArchive's backfill for this day appears incomplete/corrupted at the "
+                        f"source (confirmed not a read bug — reproduces even reading a fully "
+                        f"downloaded local copy). Not spending time on the full ~200-300 shards. "
+                        f"Pass --force-accept to process anyway if you believe this is wrong."
+                    )
+                    continue
+                logger.info(f"[{date}] quality probe OK: {ratio:.0%} of {sample_n} sampled rows have real log_messages")
 
             if max_shards:
                 # Bounded smoke-test path: process only the first N shards.
