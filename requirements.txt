@@ -3,5 +3,10 @@ pandas>=2.1.0
 pyarrow>=14.0.0
 python-dotenv>=1.0.0
 tqdm>=4.66.0
-duckdb>=1.1.0
+# duckdb<1.5.5 fails to read remote Parquet from HuggingFace's Xet storage
+# backend correctly: httpfs range requests against Xet-backed files return
+# corrupted bytes, surfacing as "Snappy decompression failure" — or, on some
+# duckdb builds, no error at all with 0 rows silently returned. Confirmed by
+# reproducing against SolArchive shards; 1.5.5 reads the same files correctly.
+duckdb>=1.5.5
 huggingface_hub>=0.25.0
