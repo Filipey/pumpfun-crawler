@@ -29,6 +29,14 @@ from collectors.solarchive_source import FLUSH_EVERY_SHARDS, list_day_shards, pr
 
 SOURCE = "solarchive"
 
+# pump.fun bonding-curve volume alone was ~2-5M trades/day per arXiv:2602.14860
+# (Sept 2025 figures) — a day finishing with far fewer events than that is a
+# collection failure, not real data (this exact bug happened once: a broken
+# duckdb version silently returned 0 rows for every shard with no error, and
+# the day still got marked "done"). Refuse to auto-accept a suspiciously low
+# count; require --force-accept to override for a genuinely quiet day.
+MIN_PLAUSIBLE_DAY_EVENTS = 50_000
+
 _LOG_FMT = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -77,6 +85,7 @@ def collect(
     single_day: str | None = None,
     max_shards: int | None = None,
     flush_every: int = FLUSH_EVERY_SHARDS,
+    force_accept: bool = False,
 ) -> None:
     if single_day:
         start = end = single_day
@@ -116,8 +125,21 @@ def collect(
                 total_events = process_day(date, store, workers=workers, flush_every=flush_every)
 
             compacted = store.compact_day(date)
-            checkpoint.mark(SOURCE, date, "done", events=total_events, rows=compacted)
-            logger.info(f"=== [{date}] DONE — {total_events:,} events, compacted rows={compacted} ===")
+
+            if total_events < MIN_PLAUSIBLE_DAY_EVENTS and not (max_shards or force_accept):
+                checkpoint.mark(SOURCE, date, "partial", events=total_events, rows=compacted)
+                logger.error(
+                    f"=== [{date}] SUSPICIOUSLY LOW — only {total_events:,} events "
+                    f"(expected {MIN_PLAUSIBLE_DAY_EVENTS:,}+). NOT marking done — this "
+                    f"almost always means a read failure was silently swallowed (check for "
+                    f"duckdb/httpfs errors above, and confirm `duckdb.__version__` is >=1.5.5 — "
+                    f"older versions can silently return 0 rows against HuggingFace's Xet "
+                    f"storage instead of raising). Rerun this day after investigating; pass "
+                    f"--force-accept if it's genuinely correct."
+                )
+            else:
+                checkpoint.mark(SOURCE, date, "done", events=total_events, rows=compacted)
+                logger.info(f"=== [{date}] DONE — {total_events:,} events, compacted rows={compacted} ===")
 
     except KeyboardInterrupt:
         logger.info("Interrupted — flushing buffered data …")
@@ -128,6 +150,15 @@ def collect(
         logger.error("Fatal error", exc_info=True)
         store.flush_all()
         raise
+
+
+def reset_days(days: list[str]) -> None:
+    """Revert the given days to 'pending' — e.g. after a bad run (bug, corrupted read) marked them done incorrectly. Does not touch already-written Parquet files; rerun the day to overwrite/dedup them."""
+    checkpoint = Checkpoint()
+    for date in days:
+        before = checkpoint.status(SOURCE, date)
+        checkpoint.reset(SOURCE, date)
+        logger.info(f"Reset {date}: {before} -> pending")
 
 
 def status(start: str, end: str) -> None:
@@ -146,6 +177,10 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="SolArchive-based pump.fun + PumpSwap backfill (Phase A).")
     parser.add_argument("--status", action="store_true", help="Print checkpoint summary and exit.")
+    parser.add_argument(
+        "--reset", metavar="YYYY-MM-DD", nargs="+", default=None,
+        help="Revert the given day(s) to pending (e.g. to redo a day wrongly marked done), then exit.",
+    )
     parser.add_argument("--day", metavar="YYYY-MM-DD", help="Collect a single day only.")
     parser.add_argument("--start", default=SOLARCHIVE_START, help=f"Start date (default: {SOLARCHIVE_START})")
     parser.add_argument("--end", default=SOLARCHIVE_END, help=f"End date (default: {SOLARCHIVE_END})")
@@ -158,8 +193,16 @@ def main() -> None:
         "--flush-every", type=int, default=FLUSH_EVERY_SHARDS,
         help=f"Flush buffered rows to disk every N shards (default: {FLUSH_EVERY_SHARDS}).",
     )
+    parser.add_argument(
+        "--force-accept", action="store_true",
+        help=f"Mark a day 'done' even if under {MIN_PLAUSIBLE_DAY_EVENTS:,} events (bypasses the low-event-count safeguard).",
+    )
 
     args = parser.parse_args()
+
+    if args.reset:
+        reset_days(args.reset)
+        sys.exit(0)
 
     if args.status:
         status(args.start, args.end)
@@ -172,6 +215,7 @@ def main() -> None:
         single_day=args.day,
         max_shards=args.max_shards,
         flush_every=args.flush_every,
+        force_accept=args.force_accept,
     )
 
 
