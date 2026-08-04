@@ -79,6 +79,12 @@ class Checkpoint:
             entry.update(meta)
             self._save()
 
+    def reset(self, source: str, chunk: str) -> None:
+        """Remove a chunk's entry entirely, reverting it to 'pending' (never touched)."""
+        with self._lock:
+            self._data["sources"].get(source, {}).pop(chunk, None)
+            self._save()
+
     def done_chunks(self, source: str) -> list[str]:
         with self._lock:
             bucket = self._data["sources"].get(source, {})
