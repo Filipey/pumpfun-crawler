@@ -147,7 +147,21 @@ def collect(
 
             compacted = store.compact_day(date)
 
-            if total_events < MIN_PLAUSIBLE_DAY_EVENTS and not (max_shards or force_accept):
+            if max_shards:
+                # Bounded smoke test — only a subset of shards were processed,
+                # so this day is NOT complete. Leave checkpoint at
+                # 'in_progress' (non-terminal — still picked up as pending by
+                # a future real run) rather than marking it 'done'. A prior
+                # version marked smoke-tested days 'done', which permanently
+                # skipped them from real backfill runs while only holding a
+                # few shards' worth of data (caught in production: 2025-12-01
+                # sat at 326,740 events — one smoke test's worth — instead of
+                # the ~8-9M a real day has).
+                logger.info(
+                    f"[{date}] smoke test only ({max_shards} shard(s)) — NOT marked done, "
+                    f"still pending for a real run"
+                )
+            elif total_events < MIN_PLAUSIBLE_DAY_EVENTS and not force_accept:
                 checkpoint.mark(SOURCE, date, "partial", events=total_events, rows=compacted)
                 logger.error(
                     f"=== [{date}] SUSPICIOUSLY LOW — only {total_events:,} events "
