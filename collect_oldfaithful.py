@@ -34,6 +34,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 from config import (
     DATA_DIR,
@@ -81,18 +82,21 @@ def _setup_logging() -> None:
 logger = logging.getLogger("collect_oldfaithful")
 
 
-def run_epoch(epoch: int, store: EntityStore, out_dir_base=OLDFAITHFUL_OUT_DIR) -> dict[str, int]:
-    """Replay one epoch through the compiled plugin binary, ingest its JSONL output, return per-date event counts."""
+def run_slot_range(
+    start_slot: int,
+    end_slot: int,
+    store: EntityStore,
+    out_dir: Path,
+    label: str,
+) -> dict[str, int]:
+    """Replay an arbitrary [start_slot, end_slot) range through the compiled plugin binary, ingest its JSONL output, return per-date event counts."""
     if not JETSTREAMER_BIN.exists():
         raise FileNotFoundError(
             f"Jetstreamer plugin binary not found at {JETSTREAMER_BIN}. "
             f"Build it first: cd pumpfun_filter_plugin && cargo build --release"
         )
 
-    start_slot, end_slot = epoch_to_slot_range(epoch)
-    out_dir = out_dir_base / f"epoch_{epoch}"
     out_dir.mkdir(parents=True, exist_ok=True)
-
     cmd = [str(JETSTREAMER_BIN), f"{start_slot}:{end_slot}"]
     env = {
         **os.environ,
@@ -104,7 +108,7 @@ def run_epoch(epoch: int, store: EntityStore, out_dir_base=OLDFAITHFUL_OUT_DIR) 
         # stale process or port clash) for something we don't use at all.
         "JETSTREAMER_CLICKHOUSE_MODE": "off",
     }
-    logger.info(f"[epoch {epoch}] running: {' '.join(cmd)} (out_dir={out_dir})")
+    logger.info(f"[{label}] running: {' '.join(cmd)} (out_dir={out_dir})")
 
     # Stream stderr live instead of buffering until exit — a single epoch
     # replay can run long (~2 days of unfiltered mainnet traffic before our
@@ -118,17 +122,17 @@ def run_epoch(epoch: int, store: EntityStore, out_dir_base=OLDFAITHFUL_OUT_DIR) 
     tail_lines: list[str] = []
     for line in proc.stdout:
         line = line.rstrip("\n")
-        logger.info(f"[epoch {epoch}] jetstreamer: {line}")
+        logger.info(f"[{label}] jetstreamer: {line}")
         tail_lines.append(line)
         tail_lines = tail_lines[-200:]
     returncode = proc.wait()
 
     if returncode != 0:
         logger.error(
-            f"[epoch {epoch}] plugin exited {returncode}\n"
+            f"[{label}] plugin exited {returncode}\n"
             f"output(tail):\n" + "\n".join(tail_lines)
         )
-        raise RuntimeError(f"epoch {epoch} replay failed (exit {returncode})")
+        raise RuntimeError(f"{label} replay failed (exit {returncode})")
 
     counts = process_output_dir(out_dir, store)
     shutil.rmtree(out_dir, ignore_errors=True)
@@ -164,7 +168,9 @@ def collect(start_date: str, end_date: str, single_epoch: int | None = None) -> 
         for chunk in todo:
             epoch = int(chunk.split("_", 1)[1])
             checkpoint.mark(SOURCE, chunk, "in_progress")
-            counts = run_epoch(epoch, store)
+            start_slot, end_slot = epoch_to_slot_range(epoch)
+            out_dir = OLDFAITHFUL_OUT_DIR / chunk
+            counts = run_slot_range(start_slot, end_slot, store, out_dir, label=f"epoch {epoch}")
             checkpoint.mark(SOURCE, chunk, "done", events=counts)
             dates_touched.update(counts.keys())
             logger.info(f"=== epoch {epoch} DONE — {counts} ===")
@@ -192,6 +198,24 @@ def status(start_date: str, end_date: str) -> None:
     print(f"Checkpoint: {checkpoint.summary(SOURCE)}")
 
 
+def smoke_test_slots(start_slot: int, end_slot: int) -> None:
+    """
+    Bounded smoke test over an arbitrary small slot range — does NOT touch
+    checkpoint state (same spirit as collect_solarchive.py's --max-shards).
+    A full epoch is ~432,000 slots and was observed taking multiple hours and
+    generating hundreds of GB of matched data; a few thousand slots finishes
+    in minutes and still exercises the whole pipeline (stream -> plugin ->
+    JSONL -> decode -> EntityStore -> compact) end to end.
+    """
+    store = EntityStore()
+    out_dir = OLDFAITHFUL_OUT_DIR / f"smoketest_{start_slot}_{end_slot}"
+    counts = run_slot_range(start_slot, end_slot, store, out_dir, label=f"slots {start_slot}:{end_slot}")
+    logger.info(f"Smoke test slots {start_slot}:{end_slot} -> {counts}")
+    for date in counts:
+        compacted = store.compact_day(date)
+        logger.info(f"Compacted {date}: {compacted}")
+
+
 def main() -> None:
     _setup_logging()
 
@@ -199,7 +223,12 @@ def main() -> None:
         description="Old Faithful/Jetstreamer-based pump.fun + PumpSwap backfill (Phase B)."
     )
     parser.add_argument("--status", action="store_true", help="Print checkpoint summary and exit.")
-    parser.add_argument("--epoch", type=int, default=None, help="Single epoch only (smoke test).")
+    parser.add_argument("--epoch", type=int, default=None, help="Single epoch only.")
+    parser.add_argument(
+        "--slots", metavar="START:END", default=None,
+        help="Bounded smoke test over an arbitrary slot range (e.g. 427680000:427690000 — a few "
+             "thousand slots, not a whole epoch). Does not touch checkpoint state.",
+    )
     parser.add_argument("--start", default=OLDFAITHFUL_START, help=f"Start date (default: {OLDFAITHFUL_START})")
     parser.add_argument("--end", default=OLDFAITHFUL_END, help=f"End date (default: {OLDFAITHFUL_END})")
 
@@ -207,6 +236,11 @@ def main() -> None:
 
     if args.status:
         status(args.start, args.end)
+        sys.exit(0)
+
+    if args.slots:
+        start_slot, end_slot = (int(x) for x in args.slots.split(":"))
+        smoke_test_slots(start_slot, end_slot)
         sys.exit(0)
 
     collect(args.start, args.end, single_epoch=args.epoch)
