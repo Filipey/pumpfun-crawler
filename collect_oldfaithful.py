@@ -94,7 +94,16 @@ def run_epoch(epoch: int, store: EntityStore, out_dir_base=OLDFAITHFUL_OUT_DIR) 
     out_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [str(JETSTREAMER_BIN), f"{start_slot}:{end_slot}"]
-    env = {**os.environ, "PUMPFUN_FILTER_OUT_DIR": str(out_dir)}
+    env = {
+        **os.environ,
+        "PUMPFUN_FILTER_OUT_DIR": str(out_dir),
+        # Our plugin ignores the `_db` parameter entirely (writes straight to
+        # JSONL) — jetstreamer's default "auto" mode tries to spawn/manage its
+        # own bundled ClickHouse server regardless, which failed in practice
+        # ("Failed to find the PID of the running ClickHouse server", likely a
+        # stale process or port clash) for something we don't use at all.
+        "JETSTREAMER_CLICKHOUSE_MODE": "off",
+    }
     logger.info(f"[epoch {epoch}] running: {' '.join(cmd)} (out_dir={out_dir})")
 
     result = subprocess.run(cmd, env=env, capture_output=True, text=True)
