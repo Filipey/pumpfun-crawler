@@ -43,7 +43,7 @@ use futures_util::FutureExt;
 use jetstreamer::{
     firehose::{BlockData, TransactionData},
     plugin::{Plugin, PluginFuture},
-    JetstreamerInvocation, JetstreamerRunner,
+    JetstreamerRunner,
 };
 use once_cell::sync::Lazy;
 use serde::Serialize;
@@ -204,19 +204,19 @@ impl Plugin for PumpFilterPlugin {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // NOTE: jetstreamer 0.6.0 (the version actually published to crates.io,
+    // confirmed by reading its real source — the README's JetstreamerInvocation
+    // enum with Run/ListPlugins doesn't exist here, that's a newer git-only
+    // API) has JetstreamerRunner::parse_cli_args(self) -> Result<Self, _>: it
+    // just parses env/CLI into self.config and hands the same runner back.
     let out_dir = std::env::var("PUMPFUN_FILTER_OUT_DIR").unwrap_or_else(|_| "./out".to_string());
 
-    match JetstreamerRunner::default()
+    JetstreamerRunner::default()
         .with_log_level("info")
         .with_plugin(Box::new(PumpFilterPlugin::new(PathBuf::from(out_dir))))
         .parse_cli_args()?
-    {
-        JetstreamerInvocation::Run(runner) => runner
-            .run()
-            .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?,
-        JetstreamerInvocation::ListPlugins => {
-            println!("pumpfun-filter (custom, always registered by this binary)");
-        }
-    }
+        .run()
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
+
     Ok(())
 }
