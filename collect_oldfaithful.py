@@ -106,13 +106,29 @@ def run_epoch(epoch: int, store: EntityStore, out_dir_base=OLDFAITHFUL_OUT_DIR) 
     }
     logger.info(f"[epoch {epoch}] running: {' '.join(cmd)} (out_dir={out_dir})")
 
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
+    # Stream stderr live instead of buffering until exit — a single epoch
+    # replay can run long (~2 days of unfiltered mainnet traffic before our
+    # plugin filters it down), and with plain subprocess.run(capture_output=
+    # True) nothing is visible at all until the process finishes or fails,
+    # making a slow-but-healthy run indistinguishable from a hung one.
+    proc = subprocess.Popen(
+        cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    tail_lines: list[str] = []
+    for line in proc.stdout:
+        line = line.rstrip("\n")
+        logger.info(f"[epoch {epoch}] jetstreamer: {line}")
+        tail_lines.append(line)
+        tail_lines = tail_lines[-200:]
+    returncode = proc.wait()
+
+    if returncode != 0:
         logger.error(
-            f"[epoch {epoch}] plugin exited {result.returncode}\n"
-            f"stdout(tail):\n{result.stdout[-4000:]}\nstderr(tail):\n{result.stderr[-4000:]}"
+            f"[epoch {epoch}] plugin exited {returncode}\n"
+            f"output(tail):\n" + "\n".join(tail_lines)
         )
-        raise RuntimeError(f"epoch {epoch} replay failed (exit {result.returncode})")
+        raise RuntimeError(f"epoch {epoch} replay failed (exit {returncode})")
 
     counts = process_output_dir(out_dir, store)
     shutil.rmtree(out_dir, ignore_errors=True)
