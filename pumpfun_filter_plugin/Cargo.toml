@@ -13,6 +13,7 @@ description = "Jetstreamer plugin: filters Old Faithful replay to pump.fun/PumpS
 # match them here.
 [dependencies]
 jetstreamer = "0.6"
+clickhouse = { version = "0.15", default-features = false }
 solana-message = "3"
 solana-transaction-status = "3"
 solana-signature = { version = "3", default-features = false }
