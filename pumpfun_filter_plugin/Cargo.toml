@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "Jetstreamer plugin: filters Old Faithful replay to pump.fun/PumpSwap transactions, dumps JSONL for collectors/oldfaithful_source.py"
 
-# NOTE: version numbers pinned to match jetstreamer's own Cargo.toml (as of
-# anza-xyz/jetstreamer commit at time of writing) to avoid type-mismatch
-# errors from depending on a different major version of the same solana-*
-# crates that TransactionData/BlockData expose fields of. If `cargo build`
-# reports type mismatches on `tx.transaction.message` / `transaction_status_meta`,
-# check jetstreamer's current Cargo.toml for the versions it now pins and
-# match them here.
+# NOTE: version numbers must match what jetstreamer 0.6.0 (the version
+# actually published to crates.io, not its git HEAD) resolves internally, or
+# cargo unifies to two separate instances of the same crate and types like
+# clickhouse::Client stop matching across the Plugin trait boundary (hit this
+# for real: jetstreamer-plugin pulls clickhouse 0.14.3, not 0.15.x). If
+# `cargo build` reports a type mismatch on a type jetstreamer's Plugin trait
+# exposes, check `grep -A2 'name = "<crate>"' Cargo.lock` for duplicate
+# resolved versions and pin the exact one jetstreamer-plugin already uses.
 [dependencies]
 jetstreamer = "0.6"
-clickhouse = { version = "0.15", default-features = false }
+clickhouse = { version = "=0.14.3", default-features = false }
 solana-message = "3"
 solana-transaction-status = "3"
 solana-signature = { version = "3", default-features = false }
