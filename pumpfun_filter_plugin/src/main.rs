@@ -3,25 +3,16 @@
 //! to per-thread JSON-Lines files, for collectors/oldfaithful_source.py to
 //! pick up and feed through the existing Python decoder/EntityStore.
 //!
-//! *** UNCOMPILED / UNVERIFIED ***
+//! Compiled and run to completion in production (2026-08-04..2026-08-25),
+//! driving the full Phase B backfill — see this crate's README.md for the
+//! detailed design writeup and observed operational characteristics
+//! (throughput tuning, epoch-selection padding, transient-retry behavior).
 //! Written by close reference to jetstreamer's actual source (Plugin trait
 //! definition in jetstreamer-plugin/src/lib.rs, the real
 //! jetstreamer-plugin/src/plugins/program_tracking.rs reference plugin, and
 //! TransactionData/BlockData struct definitions in
 //! jetstreamer-firehose/src/firehose.rs — all inspected directly, not
-//! guessed from the README alone) but there is no Rust toolchain available
-//! in the environment this was written in (jetstreamer itself requires
-//! Clang 16 + RocksDB to build — see its README). This has NOT been
-//! compiled. Build it on the lab server first:
-//!
-//!     cd pumpfun_filter_plugin
-//!     cargo build --release
-//!
-//! If it fails to compile, the most likely cause is a solana-* crate
-//! version drift between this Cargo.toml and jetstreamer's current
-//! Cargo.toml (pin to whatever jetstreamer itself now depends on) — this
-//! plugin's dependency versions were copied from jetstreamer's own
-//! Cargo.toml at the time of writing.
+//! guessed from the README alone).
 //!
 //! Output format: one JSON object per line, per (thread, run) output file
 //! (`<out_dir>/part-<thread_id>.jsonl`, appended across the whole run so a
