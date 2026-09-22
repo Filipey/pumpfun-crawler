@@ -191,6 +191,29 @@ class EntityStore:
         for rec in records:
             self.add(date, rec)
 
+    def add_row(self, table: str, date: str, row: dict) -> None:
+        """
+        Buffer a pre-shaped row directly into `table`, bypassing _route().
+
+        Phase C rows (token_metadata, token_images, token_pumpfun_api) are
+        produced by collect_metadata.py from HTTP responses, not by decoder.py
+        from chain events, so they have no `tx_type` for _route() to dispatch
+        on. Routing them would mean inventing fake tx_type values purely to
+        satisfy a dispatcher that exists for on-chain records.
+        """
+        if table not in ENTITY_TABLES:
+            raise KeyError(f"Unknown entity table: {table}")
+        with self._lock:
+            self._buffers[table][date].append(row)
+
+    def add_rows(self, table: str, date: str, rows: list[dict]) -> None:
+        if table not in ENTITY_TABLES:
+            raise KeyError(f"Unknown entity table: {table}")
+        if not rows:
+            return
+        with self._lock:
+            self._buffers[table][date].extend(rows)
+
     # ── Flushing ──────────────────────────────────────────────────────────────
 
     def flush_batch(self, date: str) -> dict[str, int]:

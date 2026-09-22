@@ -78,15 +78,81 @@ TOKEN_DTYPES: dict = {
     "created_signature":"str",
 }
 
+# ── Phase C: off-chain metadata + images ─────────────────────────────────────
+# Populated by collect_metadata.py. See docs/metadata_image_collection_plan.md.
+
 TOKEN_METADATA_DTYPES: dict = {
-    "mint":             "str",    # FK -> tokens.mint
-    "image_url":        "str",
+    "mint":             "str",    # PK, FK -> tokens.mint
+    "uri":              "str",    # raw tokens.uri as collected on-chain
+    "fetched_url":      "str",    # what we actually hit after CID re-routing
+    "gateway":          "str",    # which gateway served it
+    # Off-chain name/symbol can disagree with the on-chain CreateEvent values;
+    # that disagreement is itself a taxonomy signal, so both are kept.
+    "meta_name":        "str",
+    "meta_symbol":      "str",
     "description":      "str",
+    "image_url":        "str",
+    "image_cid":        "str",    # extracted CID, NULL for non-IPFS hosts
     "twitter":          "str",
     "telegram":         "str",
     "website":          "str",
-    "resolved_status":  "str",    # ok | not_found | timeout | invalid_json | pending
+    "coin_community":   "str",
+    "video_url":        "str",
+    "banner_url":       "str",
+    "show_name":        "bool",
+    "created_on":       "str",
+    "extra_json":       "str",    # unmodelled keys, verbatim JSON
+    "status":           "str",    # ok|no_uri|http_error|timeout|invalid_json|all_gateways_failed
+    "http_status":      "Int64",
+    "attempts":         "Int64",
     "resolved_at":      "Int64",
+}
+
+TOKEN_IMAGE_DTYPES: dict = {
+    "mint":             "str",    # PK, FK -> tokens.mint
+    "image_url":        "str",
+    "image_cid":        "str",
+    "sha256":           "str",    # of STORED bytes — dedup key, joins to blob shards
+    "shard":            "str",    # e.g. "shard_000123.parquet"
+    "status":           "str",    # ok|no_url|http_error|timeout|decode_error|unsupported|too_large
+    "http_status":      "Int64",
+    "strategy":         "str",    # original_local | gateway_transform
+    "orig_bytes":       "Int64",  # exact, from content-range/content-length
+    # Original dimensions are parsed from the first few KB of the source bytes.
+    # They are unrecoverable once the gateway transform path is used (it
+    # resizes server-side and leaks no source size), which is why the default
+    # strategy downloads originals — see the plan doc, section 2.
+    "orig_width":       "Int64",
+    "orig_height":      "Int64",
+    "orig_format":      "str",
+    # Animation is flattened to frame 0 when stored; the fact is retained here.
+    "is_animated":      "bool",
+    "n_frames":         "Int64",
+    "stored_bytes":     "Int64",
+    "stored_width":     "Int64",
+    "stored_height":    "Int64",
+    "fetched_at":       "Int64",
+}
+
+TOKEN_PUMPFUN_API_DTYPES: dict = {
+    "mint":                     "str",    # PK, FK -> tokens.mint
+    # nsfw/is_banned are MUTABLE moderation labels reflecting pump.fun's state
+    # at `fetched_at`, not at token creation. Treat them as "label as of
+    # fetched_at" in any downstream analysis.
+    "nsfw":                     "bool",
+    "is_banned":                "bool",
+    "reply_count":              "Int64",
+    "market_cap":               "float64",
+    "ath_market_cap":           "float64",
+    "ath_market_cap_timestamp": "Int64",
+    "total_supply":             "Int64",
+    "is_currently_live":        "bool",
+    "hide_banner":              "bool",
+    "api_image_uri":            "str",    # pump.fun's own resolved image (CDN mirror)
+    "api_metadata_uri":         "str",
+    "status":                   "str",    # ok|not_found|http_error|timeout
+    "http_status":              "Int64",
+    "fetched_at":               "Int64",
 }
 
 POOL_DTYPES: dict = {
@@ -139,6 +205,10 @@ ENTITY_TABLES: dict = {
     "graduations":          (GRADUATION_DTYPES, ["signature"]),
     "bonding_curve_trades": (BONDING_CURVE_TRADE_DTYPES, ["signature", "tx_type"]),
     "pumpswap_trades":      (PUMPSWAP_TRADE_DTYPES, ["signature", "tx_type"]),
+    # Phase C — written by collect_metadata.py, not by the decoder.
+    "token_metadata":       (TOKEN_METADATA_DTYPES, ["mint"]),
+    "token_images":         (TOKEN_IMAGE_DTYPES, ["mint"]),
+    "token_pumpfun_api":    (TOKEN_PUMPFUN_API_DTYPES, ["mint"]),
 }
 
 

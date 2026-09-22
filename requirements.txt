@@ -10,3 +10,12 @@ tqdm>=4.66.0
 # reproducing against SolArchive shards; 1.5.5 reads the same files correctly.
 duckdb>=1.5.5
 huggingface_hub>=0.25.0
+
+# ── Phase C: off-chain metadata + images (collect_metadata.py) ───────────────
+# httpx for HTTP/2 keep-alive pooling across the IPFS gateway pool; the
+# streaming API is what lets the image size guard read response headers and
+# abort an oversized download without a separate HEAD round trip.
+httpx>=0.27.0
+# Pillow decodes/resizes token images. Note it cannot parse a truncated WebP,
+# which is why collectors/image_headers.py exists for the header-only path.
+pillow>=10.0.0

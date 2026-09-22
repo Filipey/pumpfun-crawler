@@ -56,6 +56,19 @@ downloaded, so neither requires paying a data vendor.
               collectors/warehouse.py → data/warehouse.duckdb (SQL layer)
 ```
 
+On-chain collection gives us `tokens.uri` — a pointer, not content. **Phase C**
+follows those pointers:
+
+```
+┌─ Phase C: off-chain metadata + images (any time after A/B) ────┐
+│  tokens.uri --CID--> IPFS gateway pool --> token_metadata      │
+│                              │                                  │
+│                              └--> image --> 384px WebP          │
+│                                     └--> Parquet blob shards    │
+│  mint --> frontend-api-v3.pump.fun --> token_pumpfun_api        │
+└──────────────────────────────────────────────────────────────┘
+```
+
 Both phases feed the exact same decoder and storage layer, so the rest of the
 pipeline (event decoding, is_bot detection, storage, checkpointing) doesn't
 care which phase produced a given day.
@@ -67,6 +80,7 @@ care which phase produced a given day.
 ```
 collect_solarchive.py        Phase A CLI (SolArchive backfill)
 collect_oldfaithful.py        Phase B CLI (Old Faithful/Jetstreamer backfill)
+collect_metadata.py           Phase C CLI (off-chain metadata, images, moderation flags)
 collect_rpc.py                Legacy/fallback: raw-RPC crawler (kept, not primary)
 config.py                     Constants and env-var overrides
 schemas.py                    Per-entity dtype definitions + dtype casts
@@ -78,6 +92,9 @@ collectors/
   day_store.py                EntityStore: batched Parquet writer + compaction
   checkpoint.py                Per-source, per-chunk resume state
   warehouse.py                 DuckDB view/materialization layer over Parquet
+  metadata_source.py           Phase C: gateway walk, image fetch/resize, pump.fun API
+  image_headers.py             Phase C: header-only image dimension parser
+  blob_store.py                Phase C: content-addressed Parquet image blob shards
   rpc_client.py                Solana JSON-RPC client (kept for legacy path / spot checks)
 pumpfun_filter_plugin/        Rust Jetstreamer plugin for Phase B (see its own README —
                                UNCOMPILED/UNVERIFIED, needs a Rust+Clang16+RocksDB toolchain)
@@ -88,7 +105,11 @@ data/
     graduations/graduations_2025-11-01.parquet
     bonding_curve_trades/bonding_curve_trades_2025-11-01.parquet
     pumpswap_trades/pumpswap_trades_2025-11-01.parquet
+    token_metadata/token_metadata_2025-11-01.parquet
+    token_images/token_images_2025-11-01.parquet
+    token_pumpfun_api/token_pumpfun_api_2025-11-01.parquet
     …
+  images/                     Image blob shards (shard_NNNNNN.parquet); IMAGES_DIR
   warehouse.duckdb            SQL-queryable view/materialized layer over the above
   checkpoint.json             Per-source per-day/epoch status ledger
   logs/                       Rotating log files, one per CLI
@@ -97,6 +118,58 @@ data/
 Each entity table is day-partitioned and deduplicated on flush — safe to
 re-run a day without creating duplicates. See **Storage model** below for how
 part files and compaction work.
+
+---
+
+## Phase C: off-chain metadata + images
+
+`collect_metadata.py` resolves what the chain only points at: each token's
+metadata JSON, its image, and pump.fun's moderation flags — the inputs for
+multimodal taxonomy classification. Three independent, separately-checkpointed
+stages over the same day partitions:
+
+```
+metadata   tokens.uri            -> token_metadata      (~45 req/s)
+images     token_metadata.image  -> token_images + image blob shards (~27 tok/s)
+api        frontend-api-v3       -> token_pumpfun_api   (~99 req/s)
+```
+
+```bash
+python collect_metadata.py --status
+python collect_metadata.py --stage metadata --limit 10000   # pilot first
+python collect_metadata.py --stage metadata                 # then the full range
+python collect_metadata.py --stage images
+python collect_metadata.py --stage api
+```
+
+Run `--stage metadata` to completion before `--stage images`: it's the cheap
+half, it yields the description/twitter text features days earlier, and it
+tells you how many images actually exist before you commit disk.
+
+**`tokens.uri` is a CID carrier, not a URL.** ~70% of rows point at `ipfs.io`,
+which now returns HTTP 429 for everything ("switching to a service worker
+gateway only"). The collector extracts the CID and walks a gateway pool
+(pump.fun's own Pinata gateway first, then fallbacks). A collector that just
+GETs the recorded URI fails on ~70% of tokens.
+
+**Images are downloaded whole and resized locally**, not fetched through the
+gateway's server-side transform. The transform is 12x less bandwidth but
+resizes before we see any bytes and leaks no source dimensions, so keeping the
+original dimensions would cost a second request — at which point downloading
+the original is *faster* (26.7 vs 19.6 tok/s) and smaller on disk.
+`--image-strategy transform` picks the low-bandwidth path for metered links.
+
+**Image bytes go to Parquet blob shards** (`IMAGES_DIR`, HuggingFace `datasets`
+layout), content-addressed by SHA-256 so reused artwork is stored once (~17%
+of a sampled 100). `token_images` is the ledger; the filesystem is never
+scanned to decide what still needs fetching.
+
+Sizing at ~9.3M tokens: **~145 GB** on disk (~140 GB of it images), ~2.5 TB of
+transient download, ~3 days with the gateway pool. Set `IMAGES_DIR` to a
+different disk than `DATA_DIR` if needed — everything else is a few GB.
+
+Every measurement behind these choices, and the trade-offs they resolve, is in
+**Phase C methodology** below.
 
 ---
 
@@ -163,6 +236,60 @@ rerun — checkpointed per epoch under the `"oldfaithful"` source key, same
 
 ---
 
+## Quick start (Phase C — off-chain metadata + images)
+
+Runs against whatever `tokens_*.parquet` already exists, so it can start as
+soon as any Phase A/B day is compacted. Needs no API keys.
+
+```bash
+# 0. what exists and what's pending, per stage
+python collect_metadata.py --status
+
+# 1. pilot: 10k mints/day. Measures throughput and success rate on real data,
+#    and deliberately does NOT mark days done, so a real run redoes them fully.
+python collect_metadata.py --stage metadata --limit 10000
+
+# 2. metadata to completion — the cheap half (~45 req/s). Do this BEFORE images:
+#    it yields the description/twitter text features days earlier, and tells you
+#    how many images actually exist before you commit ~140 GB to them.
+python collect_metadata.py --stage metadata
+
+# 3. image pilot — confirm the ~17.6 KB mean and ~17% dedup against your data
+python collect_metadata.py --stage images --limit 10000
+
+# 4. images (the slow half, ~27 tok/s)
+python collect_metadata.py --stage images
+
+# 5. pump.fun moderation flags (~99 req/s). Check the nsfw positive rate the
+#    stage logs before relying on it as a label.
+python collect_metadata.py --stage api
+```
+
+Useful flags:
+
+| Flag | Effect |
+|---|---|
+| `--stage all` | metadata → images → api in sequence |
+| `--day YYYY-MM-DD` | one day only |
+| `--limit N` | at most N mints/day; days stay pending |
+| `--dry-run` | fetch but write nothing; checkpoint untouched |
+| `--retry-failed` | re-drive transient failures, skip terminal ones |
+| `--image-strategy transform` | ~10× less download for ~1.5× the wall clock |
+| `--no-dedup` | drop the dedup indexes (~1–2 GB RSS at full scale) |
+| `--reset YYYY-MM-DD …` | revert day(s) of `--stage` to pending |
+| `--force-accept` | finalize a day even under the 50% success floor |
+
+The window defaults to the earliest and latest day that actually has a tokens
+file, so a run never silently skips days collected past a hard-coded constant.
+
+Safe to interrupt and rerun: checkpointed per day per stage under the
+`"metadata"`, `"images"` and `"api"` source keys, and mints already carrying a
+terminal status are skipped. A day whose success ratio falls below 50% is
+**not** marked done — that is a gateway outage mid-run, not a day of bad
+tokens, and finalizing it would hide the gap permanently.
+
+---
+
 ## Configuration
 
 All options have defaults in `config.py`. Override via `.env` (copy
@@ -175,6 +302,25 @@ All options have defaults in `config.py`. Override via `.env` (copy
 | `SOLARCHIVE_WORKERS` | `4` | Concurrent shard fetches. **Do not raise this casually** — see Memory notes below |
 | `DATA_DIR` | `./data` | Root directory for all output |
 | `RPC_ENDPOINTS` | public endpoint | Only used by the legacy `collect_rpc.py` fallback path |
+
+Phase C (`collect_metadata.py`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `IMAGES_DIR` | `$DATA_DIR/images` | Image blob shards. **Deliberately separate from `DATA_DIR`** — ~140 GB at full scale while everything else is a few GB, so it often belongs on another disk |
+| `METADATA_GATEWAYS` | 4-gateway pool | Comma-separated, tried in order. Default: `pump.mypinata.cloud`, `ipfs.filebase.io`, `ipfs.raribleuserdata.com`, `gateway.pinata.cloud` |
+| `IMAGE_STRATEGY` | `original` | `original` (download + resize locally) or `transform` (gateway resizes server-side) |
+| `IMG_TARGET_PX` | `384` | Max side of stored images. **Changing this means re-collecting** |
+| `IMG_WEBP_QUALITY` | `85` | |
+| `IMG_MAX_ORIG_BYTES` | `4194304` | Above this the original is not downloaded in full |
+| `IMG_HEADER_PREFIX` | `4096` | Bytes read for the header-only dimension parse |
+| `IMG_SHARD_ROWS` | `10000` | Rows per blob shard (~160 MB) |
+| `METADATA_WORKERS` / `IMAGE_WORKERS` / `API_WORKERS` | `32` | Concurrency per stage |
+| `GATEWAY_RATE_LIMIT` | `30` | req/s **per gateway host** |
+| `PUMP_API_RATE_LIMIT` | `50` | req/s against `frontend-api-v3.pump.fun` |
+| `HTTP_TIMEOUT` / `HTTP_RETRIES` | `30` / `3` | |
+| `FLUSH_EVERY_MINTS` | `5000` | Flush buffered rows to disk every N mints |
+| `CRAWLER_UA` | project UA | **Put a real contact address here before a multi-day run** |
 
 ---
 
@@ -232,24 +378,232 @@ Two layers:
   materialize(con, ["bonding_curve_trades"])  # slower, once a phase is done — faster repeat queries
   ```
 
-### Entity tables
+## Data schemas
 
-| Table | Key | Notes |
+Every table is day-partitioned Parquet, zstd-compressed, one directory per
+table under `data/parquet/`. Types below are the pandas dtypes enforced by
+`schemas.apply_dtypes()`; `Int64`/`bool` are nullable extension dtypes, so a
+missing value is `<NA>`, never a silent `0` or `False`.
+
+Ordering of columns matches `schemas.py`, which is the single source of truth —
+`ENTITY_TABLES` maps each table to its dtype dict and dedup key, and everything
+downstream (`EntityStore`, `warehouse.refresh_views()`) iterates that mapping
+generically.
+
+### Relationships
+
+```
+tokens (mint) ─┬─< bonding_curve_trades (mint)
+               ├─< graduations (mint)
+               ├─< pools (mint) ─< pumpswap_trades (pool, mint)
+               ├─1 token_metadata (mint) ─┐
+               ├─1 token_images (mint) ───┼─> images/shard_*.parquet (sha256)
+               └─1 token_pumpfun_api (mint)
+```
+
+`tokens.mint` is the join key for the entire dataset. The three Phase C tables
+are 1:1 with `tokens` (one row per mint, whatever the outcome — a failed fetch
+still writes a row carrying its `status`, so absence in the table means "not
+attempted", never "attempted and failed").
+
+---
+
+### `tokens` — one row per token launch
+
+From `CreateEvent` on the pump.fun bonding-curve program. Dedup key: `mint`.
+
+| Column | Type | Description |
 |---|---|---|
-| `tokens` | `mint` | From CreateEvent: name, symbol, uri, creator, bonding_curve |
-| `pools` | `pool` | From CreatePoolEvent: mint, creator (coin_creator at graduation) |
-| `graduations` | `signature` | From CompleteEvent: mint, slot, block_time |
-| `bonding_curve_trades` | `signature, tx_type` | buy/sell on the pump.fun bonding curve |
-| `pumpswap_trades` | `signature, tx_type` | buy/sell on PumpSwap post-graduation |
+| `mint` | `str` | Token mint address. **Primary key for the whole dataset.** |
+| `coin_creator` | `str` | Wallet entitled to creator-fee revenue. Usually equals the submitting wallet, but not always — the program added a distinct `creator` field separate from `user` |
+| `bonding_curve` | `str` | Bonding-curve PDA address |
+| `name` | `str` | On-chain token name |
+| `symbol` | `str` | On-chain ticker |
+| `uri` | `str` | Off-chain metadata pointer. **Not a reliable URL** — see Phase C |
+| `created_slot` | `Int64` | Solana slot of the create transaction |
+| `created_at` | `Int64` | Unix seconds, from the block's `block_time` (not the event's own `timestamp` field, for consistency across phases) |
+| `created_signature` | `str` | Transaction signature of the create |
 
-Common trade columns: `signature, slot, block_time, mint, trader, tx_type,
-is_buy, v_sol_in_bonding_curve, v_tok_in_bonding_curve, sol_amount,
-token_amount, is_bot, coin_creator, coin_creator_fee, source_phase`.
-`pumpswap_trades` additionally has `pool, lp_fee, protocol_fee`.
+### `pools` — one row per PumpSwap AMM pool
 
-`source_phase` records which ingestion phase produced a row (`solarchive` |
-`oldfaithful`), useful for spot-checking one phase against the other on
-overlapping dates.
+From `CreatePoolEvent`. Dedup key: `pool`.
+
+| Column | Type | Description |
+|---|---|---|
+| `pool` | `str` | Pool address (primary key) |
+| `mint` | `str` | FK → `tokens.mint` |
+| `creator` | `str` | `coin_creator` at the time of pool creation |
+| `created_slot` | `Int64` | Slot of pool creation |
+| `created_at` | `Int64` | Unix seconds |
+| `created_signature` | `str` | Transaction signature |
+
+### `graduations` — one row per bonding-curve completion
+
+From `CompleteEvent` — the moment a token leaves the bonding curve for the AMM.
+Dedup key: `signature`.
+
+| Column | Type | Description |
+|---|---|---|
+| `mint` | `str` | FK → `tokens.mint` |
+| `signature` | `str` | Transaction signature (primary key) |
+| `slot` | `Int64` | Solana slot |
+| `block_time` | `Int64` | Unix seconds |
+
+### `bonding_curve_trades` — buys/sells on the pump.fun curve
+
+From `TradeEvent` on the bonding-curve program. Dedup key: `signature, tx_type`
+(one transaction can contain both a buy and a sell).
+
+| Column | Type | Description |
+|---|---|---|
+| `signature` | `str` | Transaction signature |
+| `slot` | `Int64` | Solana slot |
+| `block_time` | `Int64` | Unix seconds |
+| `mint` | `str` | FK → `tokens.mint` |
+| `trader` | `str` | Wallet executing the trade (the event's `user` field) |
+| `tx_type` | `str` | `buy` \| `sell` |
+| `is_buy` | `bool` | `True` for buy, `False` for sell |
+| `v_sol_in_bonding_curve` | `Int64` | Virtual SOL reserves **after** the trade, in lamports |
+| `v_tok_in_bonding_curve` | `Int64` | Virtual token reserves after the trade, raw units |
+| `sol_amount` | `Int64` | SOL exchanged, lamports |
+| `token_amount` | `Int64` | Tokens exchanged, raw units (6 decimals) |
+| `is_bot` | `bool` | Invocation-depth heuristic — see **isBot detection** below. `<NA>` when depth could not be determined |
+| `coin_creator` | `str` | Creator wallet as reported by the event |
+| `coin_creator_fee` | `Int64` | Creator revenue share paid on this trade, lamports |
+| `source_phase` | `str` | `solarchive` \| `oldfaithful` — which ingestion phase produced this row |
+
+### `pumpswap_trades` — buys/sells on the post-graduation AMM
+
+Same 15 columns as `bonding_curve_trades`, plus:
+
+| Column | Type | Description |
+|---|---|---|
+| `pool` | `str` | FK → `pools.pool` |
+| `lp_fee` | `Int64` | LP fee paid, lamports |
+| `protocol_fee` | `Int64` | Protocol fee paid, lamports |
+
+`mint` is frequently absent from the on-chain PumpSwap event (which carries only
+`pool`). `EntityStore` backfills it from a `pool → mint` index built from
+`pool_create` events and from already-written `pools` Parquet files, so a trade
+against a pool created on an earlier day still resolves its mint.
+
+Note the `v_sol_in_bonding_curve` / `v_tok_in_bonding_curve` columns are reused
+here for the AMM's reserve fields. The names are a legacy of the flat schema;
+post-graduation they are pool reserves, not bonding-curve reserves.
+
+---
+
+### `token_metadata` — resolved off-chain metadata JSON (Phase C)
+
+One row per mint. Dedup key: `mint`.
+
+| Column | Type | Description |
+|---|---|---|
+| `mint` | `str` | FK → `tokens.mint` |
+| `uri` | `str` | The raw `tokens.uri` this row was resolved from |
+| `fetched_url` | `str` | The URL actually hit, after CID extraction and gateway re-routing |
+| `gateway` | `str` | Host that served it — use this to audit gateway reliability per day |
+| `meta_name` | `str` | Name from the JSON. **May differ from on-chain `tokens.name`** — the disagreement is itself a signal |
+| `meta_symbol` | `str` | Symbol from the JSON |
+| `description` | `str` | Free-text description. Primary text feature for taxonomy |
+| `image_url` | `str` | Image pointer from the JSON — what Phase C's image stage follows |
+| `image_cid` | `str` | IPFS CID extracted from `image_url`; `<NA>` for non-IPFS hosts |
+| `twitter` | `str` | Usually an x.com profile or a specific status URL |
+| `telegram` | `str` | |
+| `website` | `str` | |
+| `coin_community` | `str` | Newer pump.fun field; absent on older tokens |
+| `video_url` | `str` | Rare (~1%) |
+| `banner_url` | `str` | Rare (~1%) |
+| `show_name` | `bool` | pump.fun display flag |
+| `created_on` | `str` | Almost always `https://pump.fun`; other values indicate a third-party launchpad |
+| `extra_json` | `str` | Any JSON keys not modelled above, verbatim, so nothing is lost |
+| `status` | `str` | `ok` \| `no_uri` \| `http_error` \| `timeout` \| `invalid_json` \| `all_gateways_failed` |
+| `http_status` | `Int64` | HTTP status of the last attempt |
+| `attempts` | `Int64` | How many candidate URLs were tried before this outcome |
+| `resolved_at` | `Int64` | Unix seconds when resolved |
+
+### `token_images` — the image ledger (Phase C)
+
+One row per mint; the **ledger**, not the bytes. Dedup key: `mint`.
+Resumption, dedup and "what still needs fetching" are all answered from this
+table — the filesystem is never scanned.
+
+| Column | Type | Description |
+|---|---|---|
+| `mint` | `str` | FK → `tokens.mint` |
+| `image_url` | `str` | The `token_metadata.image_url` this row was fetched from |
+| `image_cid` | `str` | Extracted CID; `<NA>` for non-IPFS hosts |
+| `sha256` | `str` | SHA-256 of the **stored** (re-encoded) bytes. **Join key into the blob shards** |
+| `shard` | `str` | Which shard file holds the blob, e.g. `shard_000123.parquet` |
+| `status` | `str` | `ok` \| `no_url` \| `http_error` \| `timeout` \| `decode_error` \| `unsupported` \| `too_large` |
+| `http_status` | `Int64` | HTTP status of the successful (or last) attempt |
+| `strategy` | `str` | `original_local` (downloaded and resized here) \| `gateway_transform` (server-side resize) \| `cid_dedup` (inherited from an already-stored identical CID) |
+| `orig_bytes` | `Int64` | Size of the source image before re-encoding |
+| `orig_width` | `Int64` | **Source** dimensions, before our resize |
+| `orig_height` | `Int64` | |
+| `orig_format` | `str` | `PNG` \| `JPEG` \| `WEBP` \| `GIF` \| `AVIF` \| `HEIF` \| `BMP` |
+| `is_animated` | `bool` | `True` for animated GIF/APNG/WebP. The animation is **not** stored — only frame 0 — but the fact is recorded here |
+| `n_frames` | `Int64` | Frame count of the source |
+| `stored_bytes` | `Int64` | Size of the stored WebP |
+| `stored_width` | `Int64` | Stored dimensions (≤ 384 on the long side) |
+| `stored_height` | `Int64` | |
+| `fetched_at` | `Int64` | Unix seconds |
+
+### Image blob shards — the bytes (Phase C)
+
+`$IMAGES_DIR/shard_NNNNNN.parquet`, ~10,000 rows each (~160 MB), in the layout
+HuggingFace `datasets` expects for an image column. Content-addressed, so
+reused artwork is stored once.
+
+| Column | Type | Description |
+|---|---|---|
+| `sha256` | `str` | Primary key; joins to `token_images.sha256` |
+| `bytes` | `BINARY` | The WebP image |
+| `content_type` | `str` | `image/webp` |
+| `width` | `int32` | |
+| `height` | `int32` | |
+
+```python
+import duckdb
+con = duckdb.connect()
+con.sql("""
+  SELECT t.mint, t.symbol, m.description, a.nsfw, a.is_banned, b.bytes
+  FROM 'data/parquet/tokens/tokens_*.parquet' t
+  JOIN 'data/parquet/token_metadata/token_metadata_*.parquet' m USING(mint)
+  JOIN 'data/parquet/token_images/token_images_*.parquet' i USING(mint)
+  LEFT JOIN 'data/parquet/token_pumpfun_api/token_pumpfun_api_*.parquet' a USING(mint)
+  JOIN 'data/images/shard_*.parquet' b ON b.sha256 = i.sha256
+  WHERE i.status = 'ok'
+""")
+```
+
+### `token_pumpfun_api` — pump.fun moderation and market state (Phase C)
+
+One row per mint, from `frontend-api-v3.pump.fun/coins/<mint>`. Dedup key: `mint`.
+
+> ⚠️ **`nsfw` and `is_banned` are mutable moderation labels read at
+> `fetched_at`, not attributes of the token at creation time.** Collecting in
+> late 2026 for a Nov 2025–Jul 2026 window yields the *current* label. For the
+> paper this must be described as "label as of collection date", and
+> `fetched_at` is stored precisely so that date is recoverable per row.
+
+| Column | Type | Description |
+|---|---|---|
+| `mint` | `str` | FK → `tokens.mint` |
+| `nsfw` | `bool` | pump.fun's NSFW flag. **Observed near-zero positive rate** — verify before using as a label |
+| `is_banned` | `bool` | pump.fun delisted the token |
+| `reply_count` | `Int64` | Comments on the token's pump.fun page — a social-engagement proxy |
+| `market_cap` | `float64` | Current market cap, USD |
+| `ath_market_cap` | `float64` | All-time-high market cap, USD |
+| `ath_market_cap_timestamp` | `Int64` | Unix **milliseconds** (the API's own unit; not normalised) |
+| `total_supply` | `Int64` | Raw units |
+| `is_currently_live` | `bool` | Livestreaming at fetch time |
+| `hide_banner` | `bool` | |
+| `api_image_uri` | `str` | pump.fun's own resolved image, often a CDN mirror on a different host than the metadata's `image` |
+| `api_metadata_uri` | `str` | pump.fun's record of the metadata URI |
+| `status` | `str` | `ok` \| `not_found` \| `http_error` \| `timeout` |
+| `http_status` | `Int64` | |
+| `fetched_at` | `Int64` | Unix seconds — **the timestamp the mutable labels refer to** |
 
 ---
 
@@ -279,6 +633,262 @@ was invoked (parsed from transaction logs):
 - `is_bot = True` — program invoked at log depth `[1]` (direct call, no outer program) → likely bot
 - `is_bot = False` — invoked at depth `[2]+` (through another program / dApp router) → likely human
 - `is_bot = None` — depth not found in logs
+
+This replicates the heuristic in Marino et al. (2026), §IV. It is a proxy, not
+ground truth: a sophisticated bot routing through an aggregator is classified
+human, and a power user calling the program directly is classified bot. Report
+it as "direct-invocation share", not as a bot census.
+
+---
+
+## Phase C methodology — off-chain metadata and images
+
+Everything in this section is empirical, measured 2026-09-22 against a sample
+of n=100 real pump.fun tokens drawn across several pagination offsets of
+`frontend-api-v3.pump.fun/coins`. These are the numbers to cite in a methods
+section; re-run the measurement if collection happens much later, since the
+gateway landscape moves.
+
+### `tokens.uri` is a CID carrier, not a URL
+
+Host distribution of `metadata_uri` in the sample:
+
+| Host | Share |
+|---|---|
+| `ipfs.io` | 70% |
+| `metadata.j7tracker.io` | 19% |
+| `pump.mypinata.cloud` | 4% |
+| `meta.uxento.io` | 3% |
+| `m.rapidlaunch.io`, `gateway.pinata.cloud`, `metadata.pumper.ink`, `md.sdfgsdfsdf.uk` | 1% each |
+
+**`ipfs.io` — the host on ~70% of rows — no longer serves content.** It returns
+`HTTP 429` with a notice that it is "switching to a service worker gateway
+only". `dweb.link` (same operator) likewise. A collector that GETs the recorded
+URI fails on ~70% of tokens.
+
+The collector therefore extracts the IPFS CID (`/ipfs/<cid>`, `ipfs://<cid>`)
+and walks a gateway pool. Gateway availability as measured:
+
+| Gateway | CIDv0 | CIDv1 | Notes |
+|---|---|---|---|
+| `pump.mypinata.cloud` | 200 | 200 | pump.fun's own Pinata gateway — primary |
+| `ipfs.filebase.io` | 200 | 200 | fastest (0.77 s) |
+| `ipfs.raribleuserdata.com` | 200 | 200 | |
+| `gateway.pinata.cloud` | 200 | 200 | works, slow (7.0 s) |
+| `ipfs.io`, `dweb.link` | 429 | 429 | dead |
+| `w3s.link`, `nftstorage.link`, `4everland.io` | 301/302 | | redirect-only |
+| `cf-ipfs.com`, `flk-ipfs.xyz` | conn. fail | | dead |
+
+Re-routing to `pump.mypinata.cloud` alone resolved 93/100. The 7 failures were
+all `403` — CIDs pinned by third-party launchpads, not present in pump.fun's
+own Pinata account. **All 7 recovered on the first fallback.** Non-IPFS hosts
+are fetched directly.
+
+**End-to-end validation on the 100-token sample: 100/100 metadata resolved** —
+68 via `pump.mypinata.cloud`, 7 via the `ipfs.filebase.io` fallback, 25 from
+non-IPFS hosts.
+
+### Metadata JSON field coverage
+
+Small documents (p50 294 B, max 639 B). Coverage over 93 resolved JSONs:
+
+| Key | Coverage | | Key | Coverage |
+|---|---|---|---|---|
+| `name`, `symbol`, `image` | 100% | | `website` | 42% |
+| `createdOn` | 99% | | `coin_community` | 32% |
+| `description` | 96% | | `telegram` | 8% |
+| `showName` | 75% | | `video`, `banner` | 1% |
+| `twitter` | 58% | | | |
+
+### Image characteristics
+
+99/100 downloaded (the one failure was a `gmgn.ai` CDN 403 — non-IPFS, not
+content-addressed, so unrecoverable).
+
+- **Formats**: WEBP 34, JPEG 34, PNG 29, GIF 1 (animated, 44 frames), AVIF 1
+- **Colour modes**: RGB 72, RGBA 24, P 3 (palette, some with byte transparency)
+- **Dimensions**: 512×512 dominates (32%); then 400×400, 500×500, 1024×1024,
+  291×207, 824×1200, … Median pixel count 262,144 (= 512²); largest 1254×1254.
+  Aspect ratios are mostly but not always square.
+
+Original file sizes (n=99):
+
+| | min | p10 | p25 | **p50** | p75 | p90 | p95 | p99/max | **mean** |
+|---|---|---|---|---|---|---|---|---|---|
+| bytes | 562 | 8.3 K | 13.6 K | **54.8 K** | 203.5 K | 527.0 K | 814.9 K | 2.08 M | **201.6 K** |
+
+The mean is 3.7× the median — a few multi-MB PNGs and one 2.08 MB animated GIF
+dominate. The mean is what drives disk and bandwidth estimates.
+
+### Why images are downloaded whole and resized locally
+
+`pump.mypinata.cloud` is Cloudflare-fronted and honours Cloudflare Images
+transform parameters, which cut mean transfer 201.6 KB → 22.1 KB (12.4×):
+
+```
+?img-width=384&img-height=384&img-fit=scale-down&img-format=webp&img-anim=false
+```
+
+All four parameters are load-bearing. Without `img-anim=false` the animated GIF
+returned a 1.575 MB *animated* WebP (with it: 30 KB) and that single image
+doubled the sample mean from 22.1 KB to 46.4 KB. `img-width` alone does not
+bound the other axis — tall images came back 384×477, 384×427; `img-height` +
+`img-fit=scale-down` fixes that. PNG-only resize gave 60.8 KB where WebP gave
+29.2 KB.
+
+**But the transform destroys the original dimensions.** The server resizes
+before we see any bytes, and the response headers leak no source size —
+verified on a 1254×1254 / 488,825 B PNG, where the only size-ish header is
+`cf-resized: … l=29184`, the *output* length. Preserving original dimensions
+therefore costs a second request. Head-to-head, same 71 IPFS images,
+concurrency 32, including local re-encode:
+
+| | throughput | success | dims | stored mean | download |
+|---|---|---|---|---|---|
+| transform + 4 KB Range probe (2 req) | 19.6 tok/s | 70/71 | 71/71 | 22,093 B | 1.84 MB |
+| **original + local resize (1 req)** | **26.7 tok/s** | **71/71** | **71/71** | **17,553 B** | 19.2 MB |
+
+Downloading the original wins on every axis except transfer volume: one round
+trip beats two, local WebP q85 beats Cloudflare's higher default quality, every
+CID resolves through the fallback pool, AVIF needs no special case (Cloudflare
+returns `415` for it), and the original dimensions come free from bytes already
+in memory. The cost is ~2.5 TB of transfer instead of ~0.24 TB at full scale.
+`--image-strategy transform` selects the low-bandwidth path for metered links.
+
+### Size guard, and the header-only dimension parser
+
+Some originals are pathological (p99 2.08 MB). The guard uses **streaming**
+rather than a HEAD probe, so it costs no extra round trip: headers arrive
+first, and if `content-length` exceeds `IMG_MAX_ORIG_BYTES` (4 MB default) the
+collector reads only the first 4 KB for dimensions, aborts the stream, and
+fetches a bounded rendition instead. Under 1% of images take that branch.
+
+That branch needs dimensions from a truncated prefix, and **Pillow cannot parse
+a truncated WebP** — libwebp wants the whole file, so `Image.open()` on a 4 KB
+prefix failed on 34/34 WebP images. Since WebP is ~1/3 of pump.fun token
+images, `collectors/image_headers.py` parses container headers directly.
+Validated against full-download ground truth:
+
+| prefix | parsed | **dimensions correct** | format correct |
+|---|---|---|---|
+| 512 B | 82/99 | 82 | 82 |
+| 1 KB | 96/99 | 96 | 96 |
+| **4 KB** | **99/99** | **99** | **99** |
+
+It returns `None` rather than guessing — at smaller prefixes it misses JPEGs
+(whose SOF marker can sit behind long EXIF segments) but it never returned a
+*wrong* answer at any prefix. Where the whole file is in hand, the original
+size comes from Pillow instead, which is authoritative.
+
+### Re-encoding
+
+Max 384 px on the long side, WebP q85, aspect ratio preserved, animation
+flattened to frame 0. 384 px keeps SigLIP-384, Qwen2-VL and InternVL usable at
+native tile size; 224 px would halve disk but lock out the 336/384 encoders,
+and this is a dataset you only get to build once. Palette images carrying
+transparency are converted via RGBA first (3% of the sample are mode `P`).
+
+Mean stored bytes by variant, over the sample:
+
+| variant | mean | p50 | p90 |
+|---|---|---|---|
+| originals | 201.6 K | 54.8 K | 527.0 K |
+| WebP q80, 512 px | 18.8 K | 13.0 K | 43.2 K |
+| **WebP q85, 384 px** | **16.1 K** | 11.4 K | 34.1 K |
+| WebP q85, 336 px | 13.4 K | 10.6 K | 27.4 K |
+| WebP q85, 224 px | 7.6 K | 6.3 K | 14.9 K |
+| JPEG q85, 384 px | 21.6 K | 18.8 K | 42.0 K |
+
+### Deduplication
+
+Images are content-addressed by SHA-256 of the stored bytes. Two levels:
+
+1. **CID-level (pre-download)** — a CID already stored is never downloaded
+   again, whichever mint references it. Saves bandwidth. The deduped row
+   inherits the image-level facts (dimensions, format, frame count) from the
+   first mint that fetched it, so it is a complete row, not a row of NULLs.
+2. **Content-level (post-download)** — identical bytes from different URLs
+   collapse to one blob.
+
+Measured on the 100-token sample: **83 distinct blobs from 100 tokens = 17.0%
+reuse** (recycled scam art, template launches). Reuse should be higher at full
+scale than in a 100-token window.
+
+### pump.fun frontend API
+
+`GET frontend-api-v3.pump.fun/coins/<mint>`. **There is no batch endpoint**:
+`/coins/multi`, `/coins/list` and `/coins/mints` all 404, and `GET
+/coins?mints=…` returns 200 while silently ignoring the parameter — asking for
+one specific mint returned 50 unrelated coins. So it is one request per mint.
+Measured 99 req/s at concurrency 32 with zero 429s and no `Retry-After`.
+`frontend-api.pump.fun` (without `-v3`) returns `530` — dead.
+
+### Throughput and sizing
+
+Against `pump.mypinata.cloud`, warm cache, no 429s at any level:
+
+| concurrency | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|
+| req/s | 15.2 | 24.8 | 33.1 | 37.2 | 57.9 |
+
+**Cold transforms are much slower** — a first pass over 71 uncached transform
+URLs ran at 10 req/s vs 33.5 req/s warm. Plan for cold rates; every token is a
+first visit.
+
+Token creation rate, measured by API pagination on `created_timestamp DESC`:
+1000 coins spanned 0.70 h → **≈34,300 tokens/day** (2026-09-22). Over a
+273-day window that is **N ≈ 9.3M**, but launch rates were not constant — get
+the real number from your own data before allocating disk:
+
+```bash
+python -c "import duckdb; print(duckdb.sql(\"SELECT count(*) FROM 'data/parquet/tokens/tokens_????-??-??.parquet'\"))"
+```
+
+Extrapolated to N = 9.3M:
+
+| component | per item | total |
+|---|---|---|
+| image blob shards (384 px WebP q85) | 17.6 KB | 163 GB |
+| …after ~17% content dedup | | **~139 GB** |
+| `token_metadata` parquet | ~200 B | ~1.9 GB |
+| `token_images` ledger | ~150 B | ~1.4 GB |
+| `token_pumpfun_api` | ~150 B | ~1.4 GB |
+| **total** | | **~145 GB** |
+
+Transient download ~2.5 TB (not stored). Wall clock ~7.5 days sequential on a
+single gateway, ~3 days round-robining the pool. Stage rates: metadata
+~45 req/s, images ~27 tok/s, API ~99 req/s.
+
+---
+
+## Known limitations
+
+For a methods / threats-to-validity section:
+
+1. **`is_bot` is an invocation-depth proxy**, not a bot census — see above.
+2. **`nsfw` / `is_banned` are mutable labels read at collection time**, not at
+   token creation. `token_pumpfun_api.fetched_at` records when. `nsfw` showed a
+   near-zero positive rate in sampling (0/100, and 0/70 in a market-cap-sorted
+   listing even with `includeNsfw=true`); confirm the positive rate before
+   designing a class around it. `is_banned` did produce positives (1/70).
+3. **Off-chain metadata is not immutable in practice.** IPFS content is
+   content-addressed and therefore stable, but ~30% of tokens point at ordinary
+   HTTP hosts (`j7tracker`, `uxento`, `pumper.ink`, …) that can change or
+   disappear. Some already 404. `token_metadata.gateway` and `resolved_at`
+   record what was seen and when.
+4. **Images are re-encoded, not archived.** Stored bytes are 384 px WebP q85,
+   not the original file. `orig_width`/`orig_height`/`orig_format`/`orig_bytes`
+   preserve the source characteristics, but the source bytes are gone.
+   Animation is flattened to frame 0 (`is_animated` / `n_frames` retained).
+5. **Event struct layouts changed during the window.** All observed growth is
+   fields appended at the end, so a fixed-prefix reader is correct across the
+   window — an empirical finding, not a protocol guarantee. See below.
+6. **Phase A day quality varies at the source.** SolArchive's backfill is
+   incomplete for some days; `probe_day_log_quality()` samples each day and
+   refuses days where too few rows carry real `log_messages`, rather than
+   silently collecting a partial day.
+7. **Phase B is unverified against real data** — the Rust plugin has not been
+   compiled or run here. Treat its first run as bring-up work.
 
 ---
 
