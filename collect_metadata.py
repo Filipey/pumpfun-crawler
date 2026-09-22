@@ -55,6 +55,7 @@ from collectors.metadata_source import (
     fetch_pump_api,
     make_client,
 )
+from schemas import ENTITY_TABLES
 from config import (
     API_WORKERS,
     DATA_DIR,
@@ -73,7 +74,7 @@ STAGES = ("metadata", "images", "api")
 # Statuses that mean "we got a real answer, don't ask again". Everything else
 # is transient and gets picked back up by --retry-failed.
 TERMINAL_STATUS = {
-    "metadata": {"ok", "no_uri", "invalid_json"},
+    "metadata": {"ok", "no_uri", "invalid_json", "unsupported_uri"},
     "images":   {"ok", "no_url", "decode_error", "unsupported", "too_large"},
     "api":      {"ok", "not_found"},
 }
@@ -146,6 +147,25 @@ def _available_days() -> list[str]:
 
 # ── Reading prior state ───────────────────────────────────────────────────────
 
+def _error_row(table: str, mint: str, **extra) -> dict:
+    """
+    An all-NULL row for `table` carrying a non-terminal status.
+
+    Any unexpected exception in a worker becomes one of these instead of
+    propagating out of ThreadPoolExecutor.map and aborting the day. At ~9M
+    rows something will always throw — a malformed URI, a decoder edge case,
+    a truncated response — and losing a whole day's progress to one bad row
+    is far worse than recording it as failed and moving on. "crashed" is
+    deliberately not in TERMINAL_STATUS, so --retry-failed picks these up.
+    """
+    dtypes, _ = ENTITY_TABLES[table]
+    row = {col: None for col in dtypes}
+    row["mint"] = mint
+    row["status"] = "crashed"
+    row.update(extra)
+    return row
+
+
 def _s(v) -> str | None:
     """Parquet/pandas NaN -> None, so string columns stay strings or nothing."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
@@ -207,7 +227,11 @@ def _stage_metadata(date: str, store: EntityStore, workers: int,
     def one(item):
         nonlocal done, ok
         mint, uri = item
-        row = fetch_metadata(client, mint, uri)
+        try:
+            row = fetch_metadata(client, mint, uri)
+        except Exception:
+            logger.exception(f"[{date}] metadata worker crashed on {mint} (uri={uri!r})")
+            row = _error_row("token_metadata", mint, uri=uri, resolved_at=int(time.time()))
         with lock:
             if not dry_run:
                 store.add_row("token_metadata", date, row)
@@ -324,19 +348,24 @@ def _stage_images(date: str, store: EntityStore, blobs: ImageBlobStore, workers:
                 done += 1; ok += 1; reused += 1
             return
 
-        row, data, ctype = fetch_image(client, mint, image_url, cid, strategy=strategy)
-        if data is not None and not dry_run:
-            sha, shard, was_dupe = blobs.put(
-                data, ctype or "image/webp",
-                row.get("stored_width") or 0, row.get("stored_height") or 0,
-            )
-            row["sha256"] = sha
-            row["shard"] = shard
-            if cid:
-                cid_index[cid] = {k: row.get(k) for k in _CID_CARRY}
-            if was_dupe:
-                with lock:
-                    reused += 1
+        try:
+            row, data, ctype = fetch_image(client, mint, image_url, cid, strategy=strategy)
+            if data is not None and not dry_run:
+                sha, shard, was_dupe = blobs.put(
+                    data, ctype or "image/webp",
+                    row.get("stored_width") or 0, row.get("stored_height") or 0,
+                )
+                row["sha256"] = sha
+                row["shard"] = shard
+                if cid:
+                    cid_index[cid] = {k: row.get(k) for k in _CID_CARRY}
+                if was_dupe:
+                    with lock:
+                        reused += 1
+        except Exception:
+            logger.exception(f"[{date}] image worker crashed on {mint} (url={image_url!r})")
+            row = _error_row("token_images", mint, image_url=image_url,
+                             image_cid=cid, fetched_at=int(time.time()))
         with lock:
             if not dry_run:
                 store.add_row("token_images", date, row)
@@ -391,7 +420,11 @@ def _stage_api(date: str, store: EntityStore, workers: int,
 
     def one(mint):
         nonlocal done, ok, nsfw, banned
-        row = fetch_pump_api(client, mint)
+        try:
+            row = fetch_pump_api(client, mint)
+        except Exception:
+            logger.exception(f"[{date}] api worker crashed on {mint}")
+            row = _error_row("token_pumpfun_api", mint, fetched_at=int(time.time()))
         with lock:
             if not dry_run:
                 store.add_row("token_pumpfun_api", date, row)

@@ -102,7 +102,7 @@ TOKEN_METADATA_DTYPES: dict = {
     "show_name":        "bool",
     "created_on":       "str",
     "extra_json":       "str",    # unmodelled keys, verbatim JSON
-    "status":           "str",    # ok|no_uri|http_error|timeout|invalid_json|all_gateways_failed
+    "status":           "str",    # ok|no_uri|unsupported_uri|http_error|timeout|invalid_json|all_gateways_failed
     "http_status":      "Int64",
     "attempts":         "Int64",
     "resolved_at":      "Int64",

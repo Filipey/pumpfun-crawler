@@ -517,7 +517,7 @@ One row per mint. Dedup key: `mint`.
 | `show_name` | `bool` | pump.fun display flag |
 | `created_on` | `str` | Almost always `https://pump.fun`; other values indicate a third-party launchpad |
 | `extra_json` | `str` | Any JSON keys not modelled above, verbatim, so nothing is lost |
-| `status` | `str` | `ok` \| `no_uri` \| `http_error` \| `timeout` \| `invalid_json` \| `all_gateways_failed` |
+| `status` | `str` | `ok` \| `no_uri` (column was empty) \| `unsupported_uri` (not http(s) and no extractable CID — e.g. `ar://`, `data:`; **terminal**, nothing was or ever will be attempted) \| `http_error` \| `timeout` \| `invalid_json` \| `all_gateways_failed` \| `crashed` (unexpected worker exception; retryable) |
 | `http_status` | `Int64` | HTTP status of the last attempt |
 | `attempts` | `Int64` | How many candidate URLs were tried before this outcome |
 | `resolved_at` | `Int64` | Unix seconds when resolved |
@@ -535,7 +535,7 @@ table — the filesystem is never scanned.
 | `image_cid` | `str` | Extracted CID; `<NA>` for non-IPFS hosts |
 | `sha256` | `str` | SHA-256 of the **stored** (re-encoded) bytes. **Join key into the blob shards** |
 | `shard` | `str` | Which shard file holds the blob, e.g. `shard_000123.parquet` |
-| `status` | `str` | `ok` \| `no_url` \| `http_error` \| `timeout` \| `decode_error` \| `unsupported` \| `too_large` |
+| `status` | `str` | `ok` \| `no_url` \| `unsupported` (not http(s) and no CID) \| `http_error` \| `timeout` \| `decode_error` \| `too_large` \| `crashed` (unexpected worker exception; retryable) |
 | `http_status` | `Int64` | HTTP status of the successful (or last) attempt |
 | `strategy` | `str` | `original_local` (downloaded and resized here) \| `gateway_transform` (server-side resize) \| `cid_dedup` (inherited from an already-stored identical CID) |
 | `orig_bytes` | `Int64` | Size of the source image before re-encoding |
@@ -666,8 +666,10 @@ Host distribution of `metadata_uri` in the sample:
 only". `dweb.link` (same operator) likewise. A collector that GETs the recorded
 URI fails on ~70% of tokens.
 
-The collector therefore extracts the IPFS CID (`/ipfs/<cid>`, `ipfs://<cid>`)
-and walks a gateway pool. Gateway availability as measured:
+The collector therefore extracts the IPFS CID (`/ipfs/<cid>`, `ipfs://<cid>`,
+`ipfs://ipfs/<cid>`) and walks a gateway pool. Note a bare `ipfs://<cid>` URI
+has **no host at all** — its only routes are the gateways, and it must never
+be handed to an HTTP client directly. Gateway availability as measured:
 
 | Gateway | CIDv0 | CIDv1 | Notes |
 |---|---|---|---|
