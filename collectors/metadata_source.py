@@ -35,6 +35,7 @@ import re
 import threading
 import time
 from typing import Iterator
+from urllib.parse import urlsplit
 
 import httpx
 from PIL import Image
@@ -160,6 +161,14 @@ def get(client: httpx.Client, url: str, **kwargs) -> tuple[httpx.Response | None
             last_err = "http_error"
             _sleep_for_retry(None, attempt)
             continue
+        except Exception as exc:
+            # Anything else is a property of this URL, not a transient network
+            # condition — retrying is pointless and letting it escape would
+            # kill the whole stage over one malformed row. (httpx builds a
+            # urllib Request internally for cookie handling, which raises
+            # ValueError on a URL with no usable scheme.)
+            logger.debug(f"Unfetchable URL {url!r}: {type(exc).__name__}: {exc}")
+            return None, "bad_url"
         if resp.status_code in TRANSIENT_STATUS and attempt < HTTP_RETRIES - 1:
             _sleep_for_retry(resp, attempt)
             continue
@@ -179,10 +188,25 @@ def extract_cid(url: str | None) -> str | None:
     return m.group(1) if m else None
 
 
+def _is_fetchable(url: str) -> bool:
+    """Only http(s) can be handed to the HTTP client."""
+    return isinstance(url, str) and url.startswith(("http://", "https://"))
+
+
 def _host_of(url: str) -> str:
+    """
+    Host of an http(s) URL, else "".
+
+    Naive splitting on "/" returns the CID itself for an `ipfs://<cid>` URI
+    (split gives ['ipfs:', '', '<cid>']), which then looks like a perfectly
+    good hostname to every caller. That is how an unfetchable `ipfs://` URL
+    ended up being yielded as a candidate and handed to httpx.
+    """
+    if not _is_fetchable(url):
+        return ""
     try:
-        return url.split("/")[2]
-    except IndexError:
+        return urlsplit(url).netloc
+    except ValueError:
         return ""
 
 
@@ -200,11 +224,13 @@ def candidate_urls(uri: str) -> Iterator[tuple[str, str]]:
     if cid:
         for gw in METADATA_GATEWAYS:
             yield gw + cid, _host_of(gw)
-        # Only worth re-trying the recorded host if it isn't known-dead and
-        # isn't already in the pool.
-        if host and host not in DEAD_IPFS_HOSTS and not any(host in gw for gw in METADATA_GATEWAYS):
+        # Only worth re-trying the recorded host if it's actually fetchable,
+        # isn't known-dead, and isn't already in the pool. A bare `ipfs://<cid>`
+        # URI has no host at all — its only routes are the gateways above.
+        if (host and _is_fetchable(uri) and host not in DEAD_IPFS_HOSTS
+                and not any(host in gw for gw in METADATA_GATEWAYS)):
             yield uri, host
-    elif uri.startswith("http"):
+    elif _is_fetchable(uri):
         yield uri, host
 
 
@@ -271,11 +297,20 @@ def fetch_metadata(client: httpx.Client, mint: str, uri: str | None) -> dict:
         )
         return row
 
-    row.update(
-        status="timeout" if last_err == "timeout" else (
-            "all_gateways_failed" if attempts > 1 else "http_error"),
-        http_status=last_status, attempts=attempts,
-    )
+    if attempts == 0:
+        # No candidate URL could even be built: the uri is neither http(s) nor
+        # something a CID can be extracted from (ar://, data:, a bare path, a
+        # truncated CID). Nothing was tried and nothing ever will be, so this
+        # is terminal — leaving it non-terminal would make --retry-failed
+        # re-drive these rows forever without issuing a single request.
+        status = "unsupported_uri"
+    elif last_err == "timeout":
+        status = "timeout"
+    elif attempts > 1:
+        status = "all_gateways_failed"
+    else:
+        status = "http_error"
+    row.update(status=status, http_status=last_status, attempts=attempts)
     return row
 
 
@@ -392,11 +427,18 @@ def fetch_image(
     candidates: list[str] = []
     if cid:
         candidates = [gw + cid for gw in METADATA_GATEWAYS]
-        if not any(_host_of(image_url) in gw for gw in METADATA_GATEWAYS) \
-                and _host_of(image_url) not in DEAD_IPFS_HOSTS:
+        img_host = _host_of(image_url)
+        if (img_host and _is_fetchable(image_url)
+                and img_host not in DEAD_IPFS_HOSTS
+                and not any(img_host in gw for gw in METADATA_GATEWAYS)):
             candidates.append(image_url)
-    else:
+    elif _is_fetchable(image_url):
         candidates = [image_url]
+    else:
+        # Not IPFS and not http(s) — e.g. ar://, data:, a bare path. Nothing
+        # to fetch; the raw value stays in image_url for a later pass.
+        row["status"] = "unsupported"
+        return row, None, None
 
     last_status = None
     last_err = None
@@ -526,6 +568,9 @@ def _stream_original(
         except httpx.HTTPError:
             _sleep_for_retry(None, attempt)
             last = "http_error"
+        except Exception as exc:
+            logger.debug(f"Unfetchable URL {url!r}: {type(exc).__name__}: {exc}")
+            return None, None, "bad_url", False
     return None, None, locals().get("last", "http_error"), False
 
 
