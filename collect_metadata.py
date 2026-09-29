@@ -76,6 +76,8 @@ STAGES = ("metadata", "images", "api")
 TERMINAL_STATUS = {
     "metadata": {"ok", "no_uri", "invalid_json", "unsupported_uri"},
     "images":   {"ok", "no_url", "decode_error", "unsupported", "too_large"},
+    # "endpoint_gone" is deliberately absent: it describes pump.fun's API, not
+    # the mint, so those rows must stay retryable if the route ever returns.
     "api":      {"ok", "not_found"},
 }
 
@@ -414,6 +416,25 @@ def _stage_api(date: str, store: EntityStore, workers: int,
 
     logger.info(f"[{date}] api: {len(work):,} to enrich ({len(skip):,} already done)")
     client = make_client(workers)
+
+    # Preflight on a single mint before spending N requests. If pump.fun has
+    # withdrawn the endpoint, every call returns the same 404 and the stage
+    # would otherwise write a full day of worthless rows — and they'd be
+    # unrecoverable without --reset, since the day would also trip the
+    # success-ratio guard and never finalize.
+    probe = fetch_pump_api(client, work[0])
+    if probe.get("status") == "endpoint_gone":
+        client.close()
+        logger.error(
+            f"[{date}] api: SKIPPED — pump.fun no longer serves "
+            f"GET /coins/<mint> (HTTP {probe.get('http_status')}, 'Cannot GET'). "
+            f"This is an upstream removal, not a problem with these mints: the "
+            f"route 404s even for a mint taken from pump.fun's own listing "
+            f"endpoint, and /api/coins/<mint> now requires auth. Nothing was "
+            f"written. nsfw/is_banned are unavailable until a replacement "
+            f"surface is found; metadata and images are unaffected."
+        )
+        return 0, 0
     done = ok = nsfw = banned = 0
     lock = threading.Lock()
     t0 = time.time()

@@ -596,7 +596,17 @@ def fetch_pump_api(client: httpx.Client, mint: str) -> dict:
         return row
     row["http_status"] = resp.status_code
     if resp.status_code == 404:
-        row["status"] = "not_found"
+        # Distinguish "this mint isn't in pump.fun's index" from "the route
+        # itself is gone". pump.fun removed GET /coins/<mint> (it answers
+        # `Cannot GET /coins/...` for every mint, including ones returned by
+        # its own listing endpoint a second earlier, and /api/coins/<mint>
+        # now 401s). Recording that as `not_found` would be a lie, and worse,
+        # `not_found` is terminal — it would permanently poison the table with
+        # millions of rows that --retry-failed will never revisit.
+        if "cannot get" in resp.text.lower():
+            row["status"] = "endpoint_gone"
+        else:
+            row["status"] = "not_found"
         return row
     if resp.status_code != 200:
         return row
