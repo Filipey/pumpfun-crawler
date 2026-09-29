@@ -166,6 +166,18 @@ def _log_status_histogram(date: str, stage: str, statuses: "Counter[str]") -> No
 logger = logging.getLogger("collect_metadata")
 
 
+class StageUnavailable(Exception):
+    """
+    The upstream this stage depends on is gone, so no day can succeed.
+
+    Raised rather than returning an empty result so the driver aborts the whole
+    stage and leaves every day non-terminal. Returning (0, 0) instead marked
+    each day "done" — a stage that collected nothing would look complete, and
+    if the upstream ever came back every day would be skipped until someone
+    ran --reset over all of them.
+    """
+
+
 def _dates_in_range(start: str, end: str) -> list[str]:
     d = datetime.date.fromisoformat(start)
     e = datetime.date.fromisoformat(end)
@@ -480,16 +492,15 @@ def _stage_api(date: str, store: EntityStore, workers: int,
     probe = fetch_pump_api(client, work[0])
     if probe.get("status") == "endpoint_gone":
         client.close()
-        logger.error(
-            f"[{date}] api: SKIPPED — pump.fun no longer serves "
-            f"GET /coins/<mint> (HTTP {probe.get('http_status')}, 'Cannot GET'). "
-            f"This is an upstream removal, not a problem with these mints: the "
-            f"route 404s even for a mint taken from pump.fun's own listing "
-            f"endpoint, and /api/coins/<mint> now requires auth. Nothing was "
-            f"written. nsfw/is_banned are unavailable until a replacement "
+        raise StageUnavailable(
+            f"pump.fun no longer serves GET /coins/<mint> "
+            f"(HTTP {probe.get('http_status')}, 'Cannot GET'). This is an upstream "
+            f"removal, not a problem with these mints: the route 404s even for a "
+            f"mint taken from pump.fun's own listing endpoint, and "
+            f"/api/coins/<mint> now requires auth. Nothing was written and no day "
+            f"was marked done. nsfw/is_banned are unavailable until a replacement "
             f"surface is found; metadata and images are unaffected."
         )
-        return 0, 0
     done = ok = nsfw = banned = 0
     statuses: Counter[str] = Counter()
     lock = threading.Lock()
@@ -619,6 +630,16 @@ def collect(stage: str, start: str, end: str, workers: int | None,
             else:
                 checkpoint.mark(stage, date, "done", attempted=done, ok=ok, rows=compacted)
                 logger.info(f"=== [{date}] {stage} DONE — {ok:,}/{done:,} ok, rows={compacted} ===")
+
+    except StageUnavailable as exc:
+        # Every day would hit the same wall, so don't probe 245 more times.
+        # The day already marked in_progress stays non-terminal and will be
+        # picked up again if the upstream returns.
+        checkpoint.reset(stage, date)
+        store.flush_all()
+        if blobs:
+            blobs.flush()
+        logger.error(f"Stage '{stage}' ABORTED — {exc}")
 
     except KeyboardInterrupt:
         logger.info("Interrupted — flushing buffered data …")
