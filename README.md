@@ -112,7 +112,8 @@ data/
   images/                     Image blob shards (shard_NNNNNN.parquet); IMAGES_DIR
   warehouse.duckdb            SQL-queryable view/materialized layer over the above
   checkpoint.json             Per-source per-day/epoch status ledger
-  logs/                       Rotating log files, one per CLI
+  logs/                       Rotating log files: one per CLI, and one per
+                              Phase C stage (metadata.log, images.log, api.log)
 ```
 
 Each entity table is day-partitioned and deduplicated on flush — safe to
@@ -131,7 +132,7 @@ stages over the same day partitions:
 ```
 metadata   tokens.uri            -> token_metadata      (~45 req/s)
 images     token_metadata.image  -> token_images + image blob shards (~27 tok/s)
-api        frontend-api-v3       -> token_pumpfun_api   (~99 req/s)
+api        frontend-api-v3       -> token_pumpfun_api   (unavailable since 2026-09-29)
 ```
 
 ```bash
@@ -260,8 +261,9 @@ python collect_metadata.py --stage images --limit 10000
 # 4. images (the slow half, ~27 tok/s)
 python collect_metadata.py --stage images
 
-# 5. pump.fun moderation flags (~99 req/s). Check the nsfw positive rate the
-#    stage logs before relying on it as a label.
+# 5. pump.fun moderation flags — CURRENTLY UNAVAILABLE (see below): pump.fun
+#    withdrew GET /coins/<mint> on or before 2026-09-29. The stage preflights
+#    and refuses to run, writing nothing. Left in place in case it returns.
 python collect_metadata.py --stage api
 ```
 
@@ -281,6 +283,32 @@ Useful flags:
 
 The window defaults to the earliest and latest day that actually has a tokens
 file, so a run never silently skips days collected past a hard-coded constant.
+
+### Logs
+
+Each Phase C stage writes its own rotating log under `$DATA_DIR/logs/`:
+`metadata.log`, `images.log`, `api.log` (50 MB × 10 backups, appended across
+runs). Separate files because the stages run at very different speeds —
+metadata takes hours, images days — and `--stage all` would otherwise
+interleave a multi-day image crawl with everything else.
+
+Every day logs a **status breakdown**, not just an ok count:
+
+```
+[2025-11-01] metadata status breakdown: ok=27 (79.4%)  unsupported_uri=5 (14.7%)  no_uri=2 (5.9%)
+[2025-11-01] images status breakdown: ok=27 (100.0%)
+[2025-11-01] images source formats: WEBP=16  PNG=6  JPEG=5
+[2025-11-01] blob store: {'distinct_blobs': 15, 'open_shard': 'shard_000000.parquet', ...}
+```
+
+This is the audit trail for collection quality. A day at 90% ok with the rest
+in `unsupported_uri` is healthy; the same 90% with the rest in `timeout` means
+a gateway was struggling and the day is worth re-driving with `--retry-failed`.
+Those two are indistinguishable from the ok ratio alone.
+
+`data/checkpoint.json` is the machine-readable counterpart — it records
+`attempted`, `ok` and per-table row counts for every (stage, day), which is
+what to cite for collection provenance rather than re-deriving it from logs.
 
 Safe to interrupt and rerun: checkpointed per day per stage under the
 `"metadata"`, `"images"` and `"api"` source keys, and mints already carrying a
@@ -581,6 +609,16 @@ con.sql("""
 
 One row per mint, from `frontend-api-v3.pump.fun/coins/<mint>`. Dedup key: `mint`.
 
+> ⛔ **Unavailable as of 2026-09-29: pump.fun withdrew `GET /coins/<mint>`.**
+> The route answers `Cannot GET /coins/…` for every mint — including one taken
+> from pump.fun's own listing endpoint a second earlier — and
+> `/api/coins/<mint>` now returns `401`. The listing endpoint still carries
+> these fields but caps out somewhere between offset 1000 and 3000, so it
+> cannot be swept for a full token set. The stage preflights on one mint and
+> refuses to run rather than writing a day of worthless rows; `metadata` and
+> `images` are unaffected. It worked on 2026-09-22, so the window for this
+> collection has closed unless a replacement surface turns up.
+>
 > ⚠️ **`nsfw` and `is_banned` are mutable moderation labels read at
 > `fetched_at`, not attributes of the token at creation time.** Collecting in
 > late 2026 for a Nov 2025–Jul 2026 window yields the *current* label. For the
@@ -601,7 +639,7 @@ One row per mint, from `frontend-api-v3.pump.fun/coins/<mint>`. Dedup key: `mint
 | `hide_banner` | `bool` | |
 | `api_image_uri` | `str` | pump.fun's own resolved image, often a CDN mirror on a different host than the metadata's `image` |
 | `api_metadata_uri` | `str` | pump.fun's record of the metadata URI |
-| `status` | `str` | `ok` \| `not_found` \| `http_error` \| `timeout` |
+| `status` | `str` | `ok` \| `not_found` \| `endpoint_gone` (route withdrawn upstream; **not** terminal, since it describes pump.fun's API rather than the mint) \| `http_error` \| `timeout` \| `crashed` |
 | `http_status` | `Int64` | |
 | `fetched_at` | `Int64` | Unix seconds — **the timestamp the mutable labels refer to** |
 
@@ -816,14 +854,35 @@ Measured on the 100-token sample: **83 distinct blobs from 100 tokens = 17.0%
 reuse** (recycled scam art, template launches). Reuse should be higher at full
 scale than in a 100-token window.
 
-### pump.fun frontend API
+### pump.fun frontend API — withdrawn 2026-09-29
 
-`GET frontend-api-v3.pump.fun/coins/<mint>`. **There is no batch endpoint**:
-`/coins/multi`, `/coins/list` and `/coins/mints` all 404, and `GET
-/coins?mints=…` returns 200 while silently ignoring the parameter — asking for
-one specific mint returned 50 unrelated coins. So it is one request per mint.
-Measured 99 req/s at concurrency 32 with zero 429s and no `Retry-After`.
-`frontend-api.pump.fun` (without `-v3`) returns `530` — dead.
+**Measured 2026-09-22, while it still worked**: `GET
+frontend-api-v3.pump.fun/coins/<mint>` served `nsfw`, `is_banned`,
+`reply_count`, `market_cap`, `ath_market_cap` and `total_supply` at 99 req/s
+with concurrency 32, zero 429s and no `Retry-After`. There was no batch
+endpoint — `/coins/multi`, `/coins/list` and `/coins/mints` all 404'd, and
+`GET /coins?mints=…` returned 200 while silently ignoring the parameter
+(asking for one mint returned 50 unrelated coins) — so it was one request per
+mint, roughly 1.1 days for a full token set.
+
+**Re-checked 2026-09-29: the route is gone.** It now answers `Cannot GET
+/coins/<mint>` for every mint, including one pulled from pump.fun's own
+listing endpoint a second earlier, so this is an upstream removal rather than
+a data problem. `/api/coins/<mint>` returns `401`, `searchTerm=<mint>` ignores
+the mint and returns the default listing, and `frontend-api.pump.fun` and
+`advanced-api-v2.pump.fun` both return `530`.
+
+The listing endpoint still serves the fields, but pagination caps out between
+offset 1000 and 3000 — a few thousand coins, not millions — so it is not a
+substitute. The `api` stage therefore preflights one mint and refuses to run,
+writing nothing, rather than recording a whole day as `not_found` (which is
+terminal and would need `--reset` to undo).
+
+**For the write-up**: the failure of a third-party API to remain available for
+even a week is itself the argument for the rest of the pipeline being built on
+content-addressed and archival sources. `nsfw`/`is_banned` are not recoverable
+from chain data, so unless a replacement surface appears, any moderation-flag
+analysis has to be dropped or sourced elsewhere.
 
 ### Throughput and sizing
 
@@ -868,11 +927,13 @@ single gateway, ~3 days round-robining the pool. Stage rates: metadata
 For a methods / threats-to-validity section:
 
 1. **`is_bot` is an invocation-depth proxy**, not a bot census — see above.
-2. **`nsfw` / `is_banned` are mutable labels read at collection time**, not at
-   token creation. `token_pumpfun_api.fetched_at` records when. `nsfw` showed a
-   near-zero positive rate in sampling (0/100, and 0/70 in a market-cap-sorted
-   listing even with `includeNsfw=true`); confirm the positive rate before
-   designing a class around it. `is_banned` did produce positives (1/70).
+2. **`nsfw` / `is_banned` are currently uncollectable** — pump.fun withdrew
+   `GET /coins/<mint>` on or before 2026-09-29 (it worked on 2026-09-22). Even
+   when it worked they were mutable labels read at collection time rather than
+   at token creation, `token_pumpfun_api.fetched_at` records when, and `nsfw`
+   showed a near-zero positive rate in sampling (0/100, and 0/70 in a
+   market-cap-sorted listing even with `includeNsfw=true`), so it was doubtful
+   as a label regardless. `is_banned` did produce positives (1/70).
 3. **Off-chain metadata is not immutable in practice.** IPFS content is
    content-addressed and therefore stable, but ~30% of tokens point at ordinary
    HTTP hosts (`j7tracker`, `uxento`, `pumper.ink`, …) that can change or

@@ -239,8 +239,25 @@ class EntityStore:
             part_no = self._next_part_number(table_dir, table, date)
             path = table_dir / f"{table}_{date}.part{part_no:06d}.parquet"
 
-            df = apply_dtypes(pd.DataFrame(buf), dtypes)
-            df.to_parquet(path, index=False, compression="zstd")
+            try:
+                df = apply_dtypes(pd.DataFrame(buf), dtypes)
+                df.to_parquet(path, index=False, compression="zstd")
+            except Exception:
+                # The buffer was popped before the write, so a failure here
+                # used to destroy the batch: rows gone from memory, nothing on
+                # disk, and the traceback naming only the column. Put them
+                # back so a later flush (or the caller's error handling) still
+                # has them, then let the caller see the failure.
+                with self._lock:
+                    self._buffers[table][date] = buf + self._buffers[table].get(date, [])
+                path.unlink(missing_ok=True)
+                logger.error(
+                    f"Failed to write {table}/{path.name} ({len(buf):,} rows) — "
+                    f"rows restored to the buffer, not lost",
+                    exc_info=True,
+                )
+                raise
+
             written[table] = len(df)
             logger.debug(f"Flushed batch -> {table}/{path.name} ({len(df):,} rows)")
 

@@ -8,7 +8,13 @@ Reference:
   arXiv:2602.14860 — Table on page 7-8.
 """
 
+import json
+import logging
+
+import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 # One row per on-chain event (create / buy / sell / complete).
 # Matches the paper's per-transaction record structure.
@@ -212,20 +218,149 @@ ENTITY_TABLES: dict = {
 }
 
 
+def _coerce_text(v):
+    """
+    Force a value into str-or-None.
+
+    A column declared "str" used to be tagged as object dtype without anything
+    actually checking the values, so a non-string slipped straight through to
+    the Parquet writer and only failed there — as an ArrowTypeError naming the
+    column but not the row, after the batch had already left the buffer.
+
+    Off-chain metadata JSON is attacker-controlled in practice: anyone can
+    launch a token whose metadata says `"twitter": {...}` instead of a string.
+    Containers are serialised back to JSON rather than str()'d so nothing is
+    lost and the value round-trips.
+    """
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, (dict, list, tuple)):
+        try:
+            return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(v)
+    if isinstance(v, float) and pd.isna(v):
+        return None
+    return str(v)
+
+
+def _coerce_int(v):
+    """
+    Force a value into int-or-None, exactly.
+
+    Deliberately element-wise rather than pd.to_numeric(errors="coerce"),
+    which routes through float64 whenever nulls are present and silently
+    corrupts integers above 2**53 — e.g. 100000000000000007 becomes
+    100000000000000000. Lamport amounts and raw token reserves sit right in
+    that range, so that rounding would be real, invisible data loss.
+    """
+    if v is None or isinstance(v, bool):
+        return None if v is None else int(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, float):
+        return None if pd.isna(v) else int(v)
+    if isinstance(v, str):
+        try:
+            return int(v.strip())
+        except (ValueError, AttributeError):
+            return None
+    return None
+
+
+def _coerce_float(v):
+    if v is None or isinstance(v, (dict, list, tuple)):
+        return None
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float, np.number)):
+        return None if (isinstance(v, float) and pd.isna(v)) else float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_bool(v):
+    """Only genuine truth values convert; anything else is NA rather than a
+    misleading bool({}) == False / bool({"a": 1}) == True."""
+    if v is None or isinstance(v, (dict, list, tuple)):
+        return None
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, float, np.number)):
+        if isinstance(v, float) and pd.isna(v):
+            return None
+        return bool(v) if v in (0, 1) else None
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+    return None
+
+
+# infer_dtype is a C-level scan, so a column that is already the right kind —
+# the common case, since Phase A/B values come from the Borsh decoder and are
+# well-typed by construction — costs a scan instead of a Python-level map over
+# millions of rows. Only genuinely mixed columns pay for coercion.
+_CLEAN_KINDS = {
+    "str":     ("string", "empty"),
+    "bool":    ("boolean", "empty"),
+    "Int64":   ("integer", "empty"),
+    "float64": ("floating", "integer", "empty"),
+}
+_COERCERS = {"str": _coerce_text, "bool": _coerce_bool,
+             "Int64": _coerce_int, "float64": _coerce_float}
+
+
+def _clean(series: pd.Series, dtype: str) -> pd.Series:
+    """Map the column through its coercer unless it is already well-typed."""
+    kinds = _CLEAN_KINDS.get(dtype)
+    if kinds is not None:
+        try:
+            if pd.api.types.infer_dtype(series, skipna=True) in kinds:
+                return series
+        except (TypeError, ValueError):
+            pass
+        coercer = _COERCERS.get(dtype)
+        if coercer is not None:
+            # dtype=object is load-bearing: Series.map() re-infers, and a None
+            # alongside ints infers float64, which silently rounds anything
+            # above 2**53 — the very corruption _coerce_int exists to avoid.
+            return pd.Series([coercer(v) for v in series],
+                             index=series.index, dtype=object)
+    return series
+
+
 def apply_dtypes(df: pd.DataFrame, dtype_map: dict) -> pd.DataFrame:
-    """Cast DataFrame columns to the specified dtypes; silently skip missing cols."""
+    """
+    Cast DataFrame columns to the specified dtypes; silently skip missing cols.
+
+    Values are coerced, not merely tagged. A column declared "str" that holds a
+    dict used to pass through here untouched and blow up in the Parquet writer
+    instead, which is a much worse place to find out: the batch has already
+    left the buffer and the error names the column but not the row.
+    """
     for col, dtype in dtype_map.items():
         if col not in df.columns:
             continue
         try:
+            series = _clean(df[col], dtype)
             if dtype == "bool":
-                df[col] = df[col].where(df[col].notna(), None)
-                non_null = df[col].notna()
+                series = series.where(series.notna(), None)
+                non_null = series.notna()
+                df[col] = series
                 df.loc[non_null, col] = df.loc[non_null, col].astype(bool)
             elif dtype == "str":
-                df[col] = df[col].where(df[col].notna(), None).astype("object")
+                df[col] = series.where(series.notna(), None).astype("object")
             else:
-                df[col] = df[col].astype(dtype)
-        except (ValueError, TypeError):
-            pass
+                df[col] = series.astype(dtype)
+        except (ValueError, TypeError) as exc:
+            # Leaving a column in a dtype the writer can't serialise is how a
+            # whole batch gets lost later; say so now rather than at flush.
+            logger.warning(f"Could not cast column {col!r} to {dtype}: {exc}")
     return df
