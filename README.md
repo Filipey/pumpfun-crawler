@@ -112,7 +112,8 @@ data/
   images/                     Image blob shards (shard_NNNNNN.parquet); IMAGES_DIR
   warehouse.duckdb            SQL-queryable view/materialized layer over the above
   checkpoint.json             Per-source per-day/epoch status ledger
-  logs/                       Rotating log files, one per CLI
+  logs/                       Rotating log files: one per CLI, and one per
+                              Phase C stage (metadata.log, images.log, api.log)
 ```
 
 Each entity table is day-partitioned and deduplicated on flush — safe to
@@ -282,6 +283,32 @@ Useful flags:
 
 The window defaults to the earliest and latest day that actually has a tokens
 file, so a run never silently skips days collected past a hard-coded constant.
+
+### Logs
+
+Each Phase C stage writes its own rotating log under `$DATA_DIR/logs/`:
+`metadata.log`, `images.log`, `api.log` (50 MB × 10 backups, appended across
+runs). Separate files because the stages run at very different speeds —
+metadata takes hours, images days — and `--stage all` would otherwise
+interleave a multi-day image crawl with everything else.
+
+Every day logs a **status breakdown**, not just an ok count:
+
+```
+[2025-11-01] metadata status breakdown: ok=27 (79.4%)  unsupported_uri=5 (14.7%)  no_uri=2 (5.9%)
+[2025-11-01] images status breakdown: ok=27 (100.0%)
+[2025-11-01] images source formats: WEBP=16  PNG=6  JPEG=5
+[2025-11-01] blob store: {'distinct_blobs': 15, 'open_shard': 'shard_000000.parquet', ...}
+```
+
+This is the audit trail for collection quality. A day at 90% ok with the rest
+in `unsupported_uri` is healthy; the same 90% with the rest in `timeout` means
+a gateway was struggling and the day is worth re-driving with `--retry-failed`.
+Those two are indistinguishable from the ok ratio alone.
+
+`data/checkpoint.json` is the machine-readable counterpart — it records
+`attempted`, `ok` and per-table row counts for every (stage, day), which is
+what to cite for collection provenance rather than re-deriving it from logs.
 
 Safe to interrupt and rerun: checkpointed per day per stage under the
 `"metadata"`, `"images"` and `"api"` source keys, and mints already carrying a

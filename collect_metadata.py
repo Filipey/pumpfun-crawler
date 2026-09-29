@@ -42,7 +42,9 @@ import logging.handlers
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pandas as pd
 
@@ -97,30 +99,68 @@ _LOG_FMT = "%(asctime)s %(levelname)-8s %(name)s — %(message)s"
 _DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
 
-def _setup_logging() -> None:
-    log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "metadata.log"
+_stage_file_handler: logging.Handler | None = None
 
+
+def _setup_logging() -> None:
+    """Console logging. The file handler is attached per stage by _use_stage_log()."""
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(logging.INFO)
     console.setFormatter(logging.Formatter(_LOG_FMT, _DATE_FMT))
-
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8"
-    )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter(_LOG_FMT, _DATE_FMT))
-
     root.addHandler(console)
-    root.addHandler(file_handler)
+
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("collect_metadata").info(f"Log file: {log_path}")
+
+
+def _use_stage_log(stage: str) -> Path:
+    """
+    Point the file handler at this stage's own log, under $DATA_DIR/logs/.
+
+    One file per stage rather than one shared file: the stages run at wildly
+    different speeds (metadata hours, images days) and `--stage all` would
+    otherwise interleave a multi-day image crawl with everything else, which
+    makes "what happened to the images on the 14th" painful to answer months
+    later when writing this up. Rotating + appending, so a stage resumed after
+    an interruption continues its own history.
+    """
+    global _stage_file_handler
+    root = logging.getLogger()
+    if _stage_file_handler is not None:
+        root.removeHandler(_stage_file_handler)
+        _stage_file_handler.close()
+
+    log_dir = DATA_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / f"{stage}.log"
+
+    handler = logging.handlers.RotatingFileHandler(
+        path, maxBytes=50 * 1024 * 1024, backupCount=10, encoding="utf-8"
+    )
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(_LOG_FMT, _DATE_FMT))
+    root.addHandler(handler)
+    _stage_file_handler = handler
+    return path
+
+
+def _log_status_histogram(date: str, stage: str, statuses: "Counter[str]") -> None:
+    """
+    Per-day breakdown of every outcome, not just the ok count.
+
+    This is the audit trail for collection quality: a day that is 90% ok with
+    the remainder in `unsupported_uri` is healthy, while the same 90% with the
+    remainder in `timeout` means a gateway was struggling and the day is worth
+    re-driving with --retry-failed. Both look identical from the ok ratio
+    alone, and checkpoint.json only records the totals.
+    """
+    total = sum(statuses.values()) or 1
+    parts = [f"{st}={n:,} ({n / total:.1%})" for st, n in statuses.most_common()]
+    logger.info(f"[{date}] {stage} status breakdown: " + "  ".join(parts))
 
 
 logger = logging.getLogger("collect_metadata")
@@ -223,6 +263,7 @@ def _stage_metadata(date: str, store: EntityStore, workers: int,
     logger.info(f"[{date}] metadata: {len(work):,} to resolve ({len(skip):,} already done)")
     client = make_client(workers)
     done = ok = 0
+    statuses: Counter[str] = Counter()
     lock = threading.Lock()
     t0 = time.time()
 
@@ -238,6 +279,7 @@ def _stage_metadata(date: str, store: EntityStore, workers: int,
             if not dry_run:
                 store.add_row("token_metadata", date, row)
             done += 1
+            statuses[row["status"]] += 1
             if row["status"] == "ok":
                 ok += 1
             if done % FLUSH_EVERY_MINTS == 0:
@@ -258,6 +300,7 @@ def _stage_metadata(date: str, store: EntityStore, workers: int,
     el = time.time() - t0
     logger.info(f"[{date}] metadata done: {ok:,}/{done:,} ok ({ok / max(done,1):.1%}) "
                 f"in {el:.0f}s ({done / max(el,1e-6):.0f}/s)")
+    _log_status_histogram(date, "metadata", statuses)
     return done, ok
 
 
@@ -328,6 +371,8 @@ def _stage_images(date: str, store: EntityStore, blobs: ImageBlobStore, workers:
                 f"strategy={strategy})")
     client = make_client(workers)
     done = ok = reused = 0
+    statuses: Counter[str] = Counter()
+    formats: Counter[str] = Counter()
     lock = threading.Lock()
     t0 = time.time()
 
@@ -348,6 +393,7 @@ def _stage_images(date: str, store: EntityStore, blobs: ImageBlobStore, workers:
                 if not dry_run:
                     store.add_row("token_images", date, row)
                 done += 1; ok += 1; reused += 1
+                statuses["ok"] += 1
             return
 
         try:
@@ -372,6 +418,9 @@ def _stage_images(date: str, store: EntityStore, blobs: ImageBlobStore, workers:
             if not dry_run:
                 store.add_row("token_images", date, row)
             done += 1
+            statuses[row["status"]] += 1
+            if row.get("orig_format"):
+                formats[row["orig_format"]] += 1
             if row["status"] == "ok":
                 ok += 1
             if done % FLUSH_EVERY_MINTS == 0:
@@ -394,6 +443,12 @@ def _stage_images(date: str, store: EntityStore, blobs: ImageBlobStore, workers:
     el = time.time() - t0
     logger.info(f"[{date}] images done: {ok:,}/{done:,} ok ({ok / max(done,1):.1%}), "
                 f"{reused:,} deduped, in {el:.0f}s ({done / max(el,1e-6):.1f}/s)")
+    _log_status_histogram(date, "images", statuses)
+    if formats:
+        logger.info(f"[{date}] images source formats: "
+                    + "  ".join(f"{f}={n:,}" for f, n in formats.most_common()))
+    if blobs is not None:
+        logger.info(f"[{date}] blob store: {blobs.stats()}")
     return done, ok
 
 
@@ -436,6 +491,7 @@ def _stage_api(date: str, store: EntityStore, workers: int,
         )
         return 0, 0
     done = ok = nsfw = banned = 0
+    statuses: Counter[str] = Counter()
     lock = threading.Lock()
     t0 = time.time()
 
@@ -450,6 +506,7 @@ def _stage_api(date: str, store: EntityStore, workers: int,
             if not dry_run:
                 store.add_row("token_pumpfun_api", date, row)
             done += 1
+            statuses[row["status"]] += 1
             if row["status"] == "ok":
                 ok += 1
                 nsfw += bool(row.get("nsfw"))
@@ -474,6 +531,7 @@ def _stage_api(date: str, store: EntityStore, workers: int,
     logger.info(f"[{date}] api done: {ok:,}/{done:,} ok in {el:.0f}s "
                 f"({done / max(el,1e-6):.0f}/s) — nsfw={nsfw:,} ({nsfw / max(ok,1):.3%}), "
                 f"is_banned={banned:,} ({banned / max(ok,1):.3%})")
+    _log_status_histogram(date, "api", statuses)
     return done, ok
 
 
@@ -484,6 +542,9 @@ def collect(stage: str, start: str, end: str, workers: int | None,
             dry_run: bool, strategy: str, dedup: bool, force_accept: bool) -> None:
     if single_day:
         start = end = single_day
+
+    log_path = _use_stage_log(stage)
+    logger.info(f"Stage '{stage}' log file: {log_path}")
 
     checkpoint = Checkpoint()
     store = EntityStore()
