@@ -44,7 +44,7 @@ from pathlib import Path
 import pandas as pd
 
 from config import PARQUET_DIR
-from schemas import ENTITY_TABLES, apply_dtypes
+from schemas import ENTITY_TABLES, apply_dtypes, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -240,8 +240,33 @@ class EntityStore:
             path = table_dir / f"{table}_{date}.part{part_no:06d}.parquet"
 
             try:
-                df = apply_dtypes(pd.DataFrame(buf), dtypes)
-                df.to_parquet(path, index=False, compression="zstd")
+                try:
+                    df = apply_dtypes(pd.DataFrame(buf), dtypes)
+                    df.to_parquet(path, index=False, compression="zstd")
+                except UnicodeEncodeError:
+                    # A lone UTF-16 surrogate somewhere in the batch. pandas
+                    # converts object columns to Arrow strings while building
+                    # the DataFrame, so this fires before apply_dtypes gets a
+                    # chance to coerce anything — which is why it is handled
+                    # here rather than only in the coercers. Retrying after a
+                    # sanitising pass costs nothing on clean batches, which
+                    # is nearly all of them.
+                    n_fixed = sum(
+                        1 for row in buf for v in row.values()
+                        if isinstance(v, str) and v != sanitize_text(v)
+                    )
+                    cleaned = [
+                        {k: (sanitize_text(v) if isinstance(v, str) else v)
+                         for k, v in row.items()}
+                        for row in buf
+                    ]
+                    df = apply_dtypes(pd.DataFrame(cleaned), dtypes)
+                    df.to_parquet(path, index=False, compression="zstd")
+                    logger.warning(
+                        f"{table}/{path.name}: {n_fixed} string value(s) held unpaired "
+                        f"UTF-16 surrogates (truncated emoji in off-chain text); "
+                        f"replaced with U+FFFD and written"
+                    )
             except Exception:
                 # The buffer was popped before the write, so a failure here
                 # used to destroy the batch: rows gone from memory, nothing on
@@ -269,15 +294,26 @@ class EntityStore:
         for date in pending_dates:
             self.flush_batch(date)
 
-    def compact_day(self, date: str) -> dict[str, int]:
+    def compact_day(self, date: str, tables: list[str] | None = None) -> dict[str, int]:
         """
         Merge every part file (+ any previously compacted file) for `date`
         into a single deduplicated canonical Parquet file per table, then
         remove the part files. Idempotent — safe to call again on leftovers
         from an interrupted run.
+
+        `tables` restricts the pass to specific tables; the default is every
+        table. Restricting it is what makes concurrent stages safe. Compaction
+        reads the part files it can see, writes the canonical file, then
+        deletes everything matching the part glob — so a process compacting a
+        table another process is still writing will delete part files that
+        appeared after the read, losing those rows. Each Phase C stage
+        therefore compacts only the table it owns.
         """
         compacted: dict[str, int] = {}
-        for table, (dtypes, dedup_key) in ENTITY_TABLES.items():
+        selected = ENTITY_TABLES if tables is None else {
+            t: ENTITY_TABLES[t] for t in tables if t in ENTITY_TABLES
+        }
+        for table, (dtypes, dedup_key) in selected.items():
             table_dir = self._dir / table
             if not table_dir.exists():
                 continue

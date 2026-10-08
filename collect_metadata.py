@@ -606,7 +606,10 @@ def collect(stage: str, start: str, end: str, workers: int | None,
                 checkpoint.reset(stage, date)
                 continue
 
-            compacted = store.compact_day(date)
+            # Only this stage's own table: a concurrent stage may be writing
+            # part files for the others, and compaction deletes part files it
+            # did not merge.
+            compacted = store.compact_day(date, tables=[STAGE_TABLE[stage]])
 
             if limit:
                 # A capped run only touched the first N mints of the day, so
