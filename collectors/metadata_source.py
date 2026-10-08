@@ -41,6 +41,7 @@ import httpx
 from PIL import Image
 
 from collectors.image_headers import parse_dims
+from schemas import sanitize_text
 from config import (
     CRAWLER_UA,
     DEAD_IPFS_HOSTS,
@@ -281,18 +282,56 @@ def fetch_metadata(client: httpx.Client, mint: str, uri: str | None) -> dict:
                        fetched_url=url, gateway=gw, attempts=attempts)
             return row
 
-        image_url = js.get("image")
+        # Scrub unpaired UTF-16 surrogates here, at the point the untrusted
+        # JSON enters the pipeline. json.loads() returns them happily and
+        # Python holds them fine, but they cannot be encoded to UTF-8 and
+        # blow up much later inside Arrow, by which point the error names a
+        # string offset and not the mint. Doing it here means the log says
+        # which token was malformed, and nothing downstream — the CID index,
+        # the image fetch, the logs themselves — can trip over the value.
+        dirty = [k for k, v in js.items() if isinstance(v, str) and v != sanitize_text(v)]
+        if dirty:
+            logger.warning(
+                f"{mint}: metadata field(s) {dirty} held unpaired UTF-16 surrogates "
+                f"(truncated emoji); replaced with U+FFFD"
+            )
+            js = {k: (sanitize_text(v) if isinstance(v, str) else v) for k, v in js.items()}
+
+        def text(key):
+            """
+            A text field as an exact string.
+
+            Stringifying here rather than leaving it to apply_dtypes matters
+            for non-string JSON values: pandas infers float64 for a column of
+            numbers plus NULLs while building the DataFrame, so an integer
+            would reach the coercer already rounded — a 19-digit id would land
+            as "1.2345678901234568e+18". Converting while the original value
+            is still in hand keeps it exact.
+            """
+            v = js.get(key)
+            if v is None or isinstance(v, str):
+                return v
+            if isinstance(v, bool):
+                return "true" if v else "false"
+            if isinstance(v, (int, float)):
+                return repr(v) if isinstance(v, float) else str(v)
+            try:
+                return json.dumps(v, separators=(",", ":"))
+            except (TypeError, ValueError):
+                return sanitize_text(str(v))
+
+        image_url = text("image")
         extra = {k: v for k, v in js.items() if k not in _KNOWN_KEYS}
         row.update(
             fetched_url=url, gateway=gw, status="ok", http_status=200,
             attempts=attempts, resolved_at=int(time.time()),
-            meta_name=js.get("name"), meta_symbol=js.get("symbol"),
-            description=js.get("description"), image_url=image_url,
-            image_cid=extract_cid(image_url), twitter=js.get("twitter"),
-            telegram=js.get("telegram"), website=js.get("website"),
-            coin_community=js.get("coin_community"), video_url=js.get("video"),
-            banner_url=js.get("banner"), show_name=js.get("showName"),
-            created_on=js.get("createdOn"),
+            meta_name=text("name"), meta_symbol=text("symbol"),
+            description=text("description"), image_url=image_url,
+            image_cid=extract_cid(image_url), twitter=text("twitter"),
+            telegram=text("telegram"), website=text("website"),
+            coin_community=text("coin_community"), video_url=text("video"),
+            banner_url=text("banner"), show_name=js.get("showName"),
+            created_on=text("createdOn"),
             extra_json=json.dumps(extra, separators=(",", ":")) if extra else None,
         )
         return row

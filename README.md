@@ -934,23 +934,32 @@ For a methods / threats-to-validity section:
    showed a near-zero positive rate in sampling (0/100, and 0/70 in a
    market-cap-sorted listing even with `includeNsfw=true`), so it was doubtful
    as a label regardless. `is_banned` did produce positives (1/70).
-3. **Off-chain metadata is not immutable in practice.** IPFS content is
+3. **Off-chain metadata text is sanitised, not verbatim.** Token JSON is
+   attacker-controlled: anyone can launch a token whose metadata holds a value
+   of the wrong type where a string belongs, or an unpaired UTF-16 surrogate
+   (half an emoji — `"\ud83d"`), which Python parses happily but cannot encode
+   to UTF-8. Non-string values are stringified exactly (integers are not routed
+   through float64, which would round a 19-digit id) and containers are stored
+   as JSON text; unpaired surrogates are replaced with U+FFFD, while genuine
+   emoji survive intact. Both are logged per mint with the fields involved, so
+   affected rows are identifiable after the fact.
+4. **Off-chain metadata is not immutable in practice.** IPFS content is
    content-addressed and therefore stable, but ~30% of tokens point at ordinary
    HTTP hosts (`j7tracker`, `uxento`, `pumper.ink`, …) that can change or
    disappear. Some already 404. `token_metadata.gateway` and `resolved_at`
    record what was seen and when.
-4. **Images are re-encoded, not archived.** Stored bytes are 384 px WebP q85,
+5. **Images are re-encoded, not archived.** Stored bytes are 384 px WebP q85,
    not the original file. `orig_width`/`orig_height`/`orig_format`/`orig_bytes`
    preserve the source characteristics, but the source bytes are gone.
    Animation is flattened to frame 0 (`is_animated` / `n_frames` retained).
-5. **Event struct layouts changed during the window.** All observed growth is
+6. **Event struct layouts changed during the window.** All observed growth is
    fields appended at the end, so a fixed-prefix reader is correct across the
    window — an empirical finding, not a protocol guarantee. See below.
-6. **Phase A day quality varies at the source.** SolArchive's backfill is
+7. **Phase A day quality varies at the source.** SolArchive's backfill is
    incomplete for some days; `probe_day_log_quality()` samples each day and
    refuses days where too few rows carry real `log_messages`, rather than
    silently collecting a partial day.
-7. **Phase B is unverified against real data** — the Rust plugin has not been
+8. **Phase B is unverified against real data** — the Rust plugin has not been
    compiled or run here. Treat its first run as bring-up work.
 
 ---

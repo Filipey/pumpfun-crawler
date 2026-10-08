@@ -44,7 +44,7 @@ from pathlib import Path
 import pandas as pd
 
 from config import PARQUET_DIR
-from schemas import ENTITY_TABLES, apply_dtypes
+from schemas import ENTITY_TABLES, apply_dtypes, sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -240,8 +240,33 @@ class EntityStore:
             path = table_dir / f"{table}_{date}.part{part_no:06d}.parquet"
 
             try:
-                df = apply_dtypes(pd.DataFrame(buf), dtypes)
-                df.to_parquet(path, index=False, compression="zstd")
+                try:
+                    df = apply_dtypes(pd.DataFrame(buf), dtypes)
+                    df.to_parquet(path, index=False, compression="zstd")
+                except UnicodeEncodeError:
+                    # A lone UTF-16 surrogate somewhere in the batch. pandas
+                    # converts object columns to Arrow strings while building
+                    # the DataFrame, so this fires before apply_dtypes gets a
+                    # chance to coerce anything — which is why it is handled
+                    # here rather than only in the coercers. Retrying after a
+                    # sanitising pass costs nothing on clean batches, which
+                    # is nearly all of them.
+                    n_fixed = sum(
+                        1 for row in buf for v in row.values()
+                        if isinstance(v, str) and v != sanitize_text(v)
+                    )
+                    cleaned = [
+                        {k: (sanitize_text(v) if isinstance(v, str) else v)
+                         for k, v in row.items()}
+                        for row in buf
+                    ]
+                    df = apply_dtypes(pd.DataFrame(cleaned), dtypes)
+                    df.to_parquet(path, index=False, compression="zstd")
+                    logger.warning(
+                        f"{table}/{path.name}: {n_fixed} string value(s) held unpaired "
+                        f"UTF-16 surrogates (truncated emoji in off-chain text); "
+                        f"replaced with U+FFFD and written"
+                    )
             except Exception:
                 # The buffer was popped before the write, so a failure here
                 # used to destroy the batch: rows gone from memory, nothing on

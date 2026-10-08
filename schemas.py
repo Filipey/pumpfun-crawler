@@ -218,6 +218,30 @@ ENTITY_TABLES: dict = {
 }
 
 
+def sanitize_text(s: str) -> str:
+    """
+    Strip unpaired UTF-16 surrogates so the string can be encoded as UTF-8.
+
+    json.loads() happily returns a str holding a lone surrogate — `"\\ud83d"`
+    in the source JSON, i.e. half of an emoji pair, which is what a truncated
+    or hand-edited token description produces. Python keeps it in memory
+    without complaint, but it cannot be encoded to UTF-8, so it detonates
+    later inside Arrow with a UnicodeEncodeError that names a position in the
+    string and nothing else.
+
+    The utf-16/surrogatepass round-trip recombines any genuine surrogate pair
+    (a real emoji survives intact) and replaces the unpaired remainder with
+    U+FFFD. U+FFFD is preferred over "?" or deletion because it is the
+    standard "a character was here and it was broken" marker and cannot be
+    mistaken for literal content.
+    """
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+
+
 def _coerce_text(v):
     """
     Force a value into str-or-None.
@@ -232,13 +256,17 @@ def _coerce_text(v):
     Containers are serialised back to JSON rather than str()'d so nothing is
     lost and the value round-trips.
     """
-    if v is None or isinstance(v, str):
+    if v is None:
         return v
+    if isinstance(v, str):
+        return sanitize_text(v)
     if isinstance(v, (dict, list, tuple)):
         try:
-            return json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+            # ensure_ascii escapes any surrogate inside the container, so the
+            # result is pure ASCII and encodable whatever the input held.
+            return json.dumps(v, separators=(",", ":"))
         except (TypeError, ValueError):
-            return str(v)
+            return sanitize_text(str(v))
     if isinstance(v, float) and pd.isna(v):
         return None
     return str(v)
