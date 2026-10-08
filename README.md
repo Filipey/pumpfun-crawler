@@ -284,6 +284,29 @@ Useful flags:
 The window defaults to the earliest and latest day that actually has a tokens
 file, so a run never silently skips days collected past a hard-coded constant.
 
+### Running stages in parallel
+
+`metadata` is fast and `images` is slow, so the useful arrangement is to let
+images work through the days metadata has already finished while metadata
+keeps moving forward:
+
+```bash
+# terminal 1 — works forward through the whole window
+python collect_metadata.py --stage metadata
+
+# terminal 2 — only days whose metadata is already done
+python collect_metadata.py --stage images --start 2025-11-01 --end 2025-11-20
+```
+
+This is safe: checkpoint writes take an inter-process lock around a
+re-read/merge/write, and each stage compacts only the table it owns.
+
+**Do not point both stages at the same day at the same time.** The images
+stage reads `token_metadata` for its day, so it would see a partially written
+day and record `no_url` rows for tokens whose metadata had not landed yet.
+Keep the images window behind metadata's progress — `--status` shows how far
+each stage has got.
+
 ### Logs
 
 Each Phase C stage writes its own rotating log under `$DATA_DIR/logs/`:

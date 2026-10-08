@@ -294,15 +294,26 @@ class EntityStore:
         for date in pending_dates:
             self.flush_batch(date)
 
-    def compact_day(self, date: str) -> dict[str, int]:
+    def compact_day(self, date: str, tables: list[str] | None = None) -> dict[str, int]:
         """
         Merge every part file (+ any previously compacted file) for `date`
         into a single deduplicated canonical Parquet file per table, then
         remove the part files. Idempotent — safe to call again on leftovers
         from an interrupted run.
+
+        `tables` restricts the pass to specific tables; the default is every
+        table. Restricting it is what makes concurrent stages safe. Compaction
+        reads the part files it can see, writes the canonical file, then
+        deletes everything matching the part glob — so a process compacting a
+        table another process is still writing will delete part files that
+        appeared after the read, losing those rows. Each Phase C stage
+        therefore compacts only the table it owns.
         """
         compacted: dict[str, int] = {}
-        for table, (dtypes, dedup_key) in ENTITY_TABLES.items():
+        selected = ENTITY_TABLES if tables is None else {
+            t: ENTITY_TABLES[t] for t in tables if t in ENTITY_TABLES
+        }
+        for table, (dtypes, dedup_key) in selected.items():
             table_dir = self._dir / table
             if not table_dir.exists():
                 continue
