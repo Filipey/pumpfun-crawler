@@ -294,18 +294,35 @@ keeps moving forward:
 # terminal 1 — works forward through the whole window
 python collect_metadata.py --stage metadata
 
-# terminal 2 — only days whose metadata is already done
-python collect_metadata.py --stage images --start 2025-11-01 --end 2025-11-20
+# terminal 2 — point it at the whole window; it handles the rest
+python collect_metadata.py --stage images
 ```
 
-This is safe: checkpoint writes take an inter-process lock around a
-re-read/merge/write, and each stage compacts only the table it owns.
+No window juggling is needed. `images` may only touch days `metadata` has
+marked `done`, which is exactly the condition under which that day's
+`token_metadata` file is complete (metadata marks a day done only after
+`compact_day()`). Days that aren't ready are **left pending**, the run reports
+how many, and a later run picks them up:
 
-**Do not point both stages at the same day at the same time.** The images
-stage reads `token_metadata` for its day, so it would see a partially written
-day and record `no_url` rows for tokens whose metadata had not landed yet.
-Keep the images window behind metadata's progress — `--status` shows how far
-each stage has got.
+```
+Stage 'images': 2 day(s) left pending because 'metadata' has not finished them
+yet — rerun this command once 'metadata' has advanced and they will be picked up.
+```
+
+So if images catches up with metadata, just rerun it when metadata has moved
+on — nothing is lost and nothing is double-collected. `--status` shows each
+stage's frontier.
+
+Concurrency itself is safe: checkpoint writes take an inter-process lock
+around a re-read/merge/write, and each stage compacts only the table it owns.
+
+Note the rate limiters are **per process**, so two stages running together
+allow `GATEWAY_RATE_LIMIT` each against the same gateway pool. Halve it if you
+want to keep the combined rate where it was.
+
+`--force-accept` bypasses the prerequisite gate. Only useful if a complete
+`token_metadata` exists for days the checkpoint does not record as done — a
+lost `checkpoint.json`, say.
 
 ### Logs
 
