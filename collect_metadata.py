@@ -89,6 +89,12 @@ STAGE_TABLE = {
     "api":      "token_pumpfun_api",
 }
 
+# A stage that consumes another stage's output may only touch days that stage
+# has finished. This is what makes `--stage images` safe to point at the whole
+# window while `--stage metadata` is still working through it: days that
+# aren't ready yet are left pending and picked up by a later run.
+PREREQ_STAGE = {"images": "metadata"}
+
 # A day whose success ratio collapses is a gateway outage, not a day of bad
 # tokens. Phase A learned this the hard way (see MIN_PLAUSIBLE_DAY_EVENTS in
 # collect_solarchive.py): a silently-failing source that still marks days
@@ -164,6 +170,21 @@ def _log_status_histogram(date: str, stage: str, statuses: "Counter[str]") -> No
 
 
 logger = logging.getLogger("collect_metadata")
+
+
+class DayNotReady(Exception):
+    """
+    This day's prerequisite stage hasn't finished, so it cannot be collected
+    yet — but it is not a failure either.
+
+    Raised rather than returning an empty result because the driver reads
+    (0, 0) as "finished with nothing left to do" and marks the day done. That
+    is correct for a day whose mints were all already collected, and silently
+    destructive for a day that simply has no metadata yet: the day becomes
+    terminal, so once metadata does finish it, pending_chunks() excludes it
+    and the images stage skips it forever. Observed marking two such days done
+    with zero rows.
+    """
 
 
 class StageUnavailable(Exception):
@@ -363,8 +384,7 @@ def _stage_images(date: str, store: EntityStore, blobs: ImageBlobStore, workers:
                   strategy: str, cid_index: dict) -> tuple[int, int]:
     meta = _read_table_day("token_metadata", date, ["mint", "image_url", "image_cid", "status"])
     if meta is None or meta.empty:
-        logger.warning(f"[{date}] no token_metadata — run `--stage metadata` for this day first")
-        return 0, 0
+        raise DayNotReady(f"no token_metadata rows for {date}")
     meta = meta[meta["status"] == "ok"]
 
     skip = _done_mints("images", date, retry_failed)
@@ -589,17 +609,40 @@ def collect(stage: str, start: str, end: str, workers: int | None,
         workers = {"metadata": METADATA_WORKERS, "images": IMAGE_WORKERS, "api": API_WORKERS}[stage]
 
     try:
+        skipped_not_ready = 0
         for date in todo:
+            # The images stage reads token_metadata for its day, and metadata
+            # only marks a day done after compact_day(), so "metadata is done"
+            # is exactly the condition under which that day's canonical file
+            # is complete. Running ahead of it would read a partial day (or
+            # none at all) and bank the result as final.
+            prereq = PREREQ_STAGE.get(stage)
+            if prereq and not force_accept:
+                prereq_status = checkpoint.status(prereq, date)
+                if prereq_status != "done":
+                    skipped_not_ready += 1
+                    logger.debug(
+                        f"[{date}] {stage}: not ready — {prereq} is '{prereq_status}'. "
+                        f"Left pending."
+                    )
+                    continue
+
             checkpoint.mark(stage, date, "in_progress")
             logger.info(f"=== [{date}] {stage} starting ===")
 
-            if stage == "metadata":
-                done, ok = _stage_metadata(date, store, workers, limit, retry_failed, dry_run)
-            elif stage == "images":
-                done, ok = _stage_images(date, store, blobs, workers, limit,
-                                         retry_failed, dry_run, strategy, cid_index)
-            else:
-                done, ok = _stage_api(date, store, workers, limit, retry_failed, dry_run)
+            try:
+                if stage == "metadata":
+                    done, ok = _stage_metadata(date, store, workers, limit, retry_failed, dry_run)
+                elif stage == "images":
+                    done, ok = _stage_images(date, store, blobs, workers, limit,
+                                             retry_failed, dry_run, strategy, cid_index)
+                else:
+                    done, ok = _stage_api(date, store, workers, limit, retry_failed, dry_run)
+            except DayNotReady as exc:
+                checkpoint.reset(stage, date)
+                skipped_not_ready += 1
+                logger.debug(f"[{date}] {stage}: not ready — {exc}. Left pending.")
+                continue
 
             if dry_run:
                 logger.info(f"=== [{date}] dry run — nothing written, checkpoint untouched ===")
@@ -633,6 +676,14 @@ def collect(stage: str, start: str, end: str, workers: int | None,
             else:
                 checkpoint.mark(stage, date, "done", attempted=done, ok=ok, rows=compacted)
                 logger.info(f"=== [{date}] {stage} DONE — {ok:,}/{done:,} ok, rows={compacted} ===")
+
+        if skipped_not_ready:
+            prereq = PREREQ_STAGE.get(stage)
+            logger.info(
+                f"Stage '{stage}': {skipped_not_ready} day(s) left pending because "
+                f"'{prereq}' has not finished them yet — rerun this command once "
+                f"'{prereq}' has advanced and they will be picked up."
+            )
 
     except StageUnavailable as exc:
         # Every day would hit the same wall, so don't probe 245 more times.
